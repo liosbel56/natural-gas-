@@ -4,645 +4,514 @@ from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 import requests
 import streamlit as st
-import plotly.graph_objects as go
 from streamlit_autorefresh import st_autorefresh
 
 # =====================================================
 # CONFIGURACIÓN
 # =====================================================
 st.set_page_config(
-    page_title="COSITA RICA MIA💜",
+    page_title="Kalshi Signal Bot",
     page_icon="📈",
-    layout="wide"
+    layout="wide",
 )
 
-API = "https://api.elections.kalshi.com/trade-api/v2"
-HEADERS = {"User-Agent": "KalshiEarlySignalBot/1.0"}
+KALSHI_API = "https://external-api.kalshi.com/trade-api/v2"
+COINBASE_API = "https://api.exchange.coinbase.com"
+BIQUOTE_API = "https://biquote.io/api"
 
-SERIES = {
-    "BTC/USD": "KXBTC15M",
-    "EUR/USD": "KXEURUSD15M",
-}
+# Actualización visual cada segundo.
+st_autorefresh(interval=1000, key="refresh")
 
-st.markdown("""
-<style>
-.stApp {
-    background: linear-gradient(145deg, #10091f, #1b1030);
-    color: #f5efff;
-}
-h1,h2,h3,p,label {
-    color: #f5efff !important;
-}
-div[data-testid="stMetric"] {
-    background: #291744;
-    border: 1px solid #7545a8;
-    padding: 12px;
-    border-radius: 12px;
-}
-.signal {
-    background: #291744;
-    border: 1px solid #7545a8;
-    border-radius: 14px;
-    text-align: center;
-    padding: 18px;
-    font-size: 28px;
-    font-weight: bold;
-}
-</style>
-""", unsafe_allow_html=True)
+st.title("📈 KALSHI SIGNAL BOT")
+st.caption("Bitcoin + EUR/USD | Velas de 1 minuto | Contratos de 15 minutos")
+st.warning(
+    "Señales estimadas, no garantías. El bot no ejecuta compras reales."
+)
 
-st.title("📈 Kalshi Early Signal Bot")
-st.caption("BTC/USD · EUR/USD · Ventanas de 15 minutos · Sin compras automáticas")
 
-st_autorefresh(interval=5000, key="refresh")
-
-market_name = st.selectbox("Selecciona el mercado", list(SERIES.keys()))
-series_ticker = SERIES[market_name]
-
-with st.expander("⚙️ Ajustes de las señales"):
-    min_score = st.slider("Confluencia mínima", 3, 7, 5)
-    min_adx = st.slider("ADX mínimo", 10, 35, 18)
-    max_entry_price = st.slider(
-        "Precio máximo de contrato que quieres considerar ($)",
-        0.10, 0.95, 0.60, 0.01
+# =====================================================
+# PETICIONES Y UTILIDADES
+# =====================================================
+def fetch_json(url, params=None):
+    response = requests.get(
+        url,
+        params=params,
+        timeout=12,
+        headers={"User-Agent": "KalshiSignalBot/1.0"},
     )
+    response.raise_for_status()
+    return response.json()
 
-# =====================================================
-# UTILIDADES
-# =====================================================
-def parse_time(value):
-    if not value:
-        return None
+
+def num(value):
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if value is None or value == "":
+            return np.nan
+        return float(value)
     except (ValueError, TypeError):
-        return None
+        return np.nan
 
 
-def format_time_remaining(close_time):
-    close_dt = parse_time(close_time)
-    if not close_dt:
-        return "No disponible"
-
-    seconds = max(
-        0, int((close_dt - datetime.now(timezone.utc)).total_seconds())
-    )
-    mins, secs = divmod(seconds, 60)
-    hours, mins = divmod(mins, 60)
-
-    if hours:
-        return f"{hours:02d}:{mins:02d}:{secs:02d}"
-    return f"{mins:02d}:{secs:02d}"
+def price_cents(market, *fields):
+    for field in fields:
+        value = num(market.get(field))
+        if np.isfinite(value):
+            if field.endswith("_dollars"):
+                return value * 100
+            return value
+    return np.nan
 
 
 # =====================================================
-# CONTRATO REAL DE KALSHI
+# KALSHI: CONTRATO ABIERTO MÁS PRÓXIMO A CERRAR
+# =====================================================
+@st.cache_data(ttl=3, show_spinner=False)
+def get_market(series):
+    data = fetch_json(
+        f"{KALSHI_API}/markets",
+        params={
+            "series_ticker": series,
+            "status": "open",
+            "limit": 100,
+        },
+    )
+
+    now = datetime.now(timezone.utc).timestamp()
+    candidates = []
+
+    for market in data.get("markets", []):
+        close_text = (
+            market.get("close_time")
+            or market.get("expiration_time")
+        )
+        if not close_text:
+            continue
+
+        try:
+            close_dt = datetime.fromisoformat(
+                close_text.replace("Z", "+00:00")
+            )
+            close_ts = close_dt.timestamp()
+        except (TypeError, ValueError):
+            continue
+
+        if close_ts > now:
+            item = dict(market)
+            item["_close_ts"] = close_ts
+            candidates.append(item)
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: item["_close_ts"])
+    return candidates[0]
+
+
+def get_yes_probability(market):
+    bid = price_cents(market, "yes_bid_dollars", "yes_bid")
+    ask = price_cents(market, "yes_ask_dollars", "yes_ask")
+    last = price_cents(market, "last_price_dollars", "last_price")
+
+    if np.isfinite(bid) and np.isfinite(ask) and ask >= bid:
+        return (bid + ask) / 2
+    if np.isfinite(last):
+        return last
+    if np.isfinite(bid):
+        return bid
+    return np.nan
+
+
+def get_strike(market):
+    floor = num(market.get("floor_strike"))
+    cap = num(market.get("cap_strike"))
+    strike = num(market.get("strike_price"))
+
+    if np.isfinite(floor) and np.isfinite(cap):
+        return f"Entre {floor:g} y {cap:g}"
+    if np.isfinite(floor):
+        return f"Desde {floor:g}"
+    if np.isfinite(cap):
+        return f"Hasta {cap:g}"
+    if np.isfinite(strike):
+        return f"{strike:g}"
+
+    return "No confirmado por el API"
+
+
+# =====================================================
+# BITCOIN: COINBASE
 # =====================================================
 @st.cache_data(ttl=5, show_spinner=False)
-def fetch_kalshi_series(series):
-    url = f"{API}/markets"
-    params = {"series_ticker": series, "limit": 100}
-
-    response = requests.get(
-        url, params=params, headers=HEADERS, timeout=12
-    )
-    response.raise_for_status()
-    payload = response.json()
-
-    markets = payload.get("markets", [])
-    now = datetime.now(timezone.utc)
-
-    active = []
-
-    for item in markets:
-        status = str(item.get("status", "")).lower()
-        start = parse_time(item.get("open_time"))
-        close = parse_time(item.get("close_time"))
-
-        # Los nombres de estado pueden variar entre etapas del mercado.
-        if (
-            status in ("active", "open")
-            and start is not None
-            and close is not None
-            and start <= now < close
-        ):
-            active.append(item)
-
-    active.sort(key=lambda x: x.get("close_time", ""))
-    return active
-
-
-def dollars(value):
-    try:
-        return f"${float(value):.2f}"
-    except (TypeError, ValueError):
-        return "N/D"
-
-
-# =====================================================
-# DATOS DEL ACTIVO
-# =====================================================
-@st.cache_data(ttl=10, show_spinner=False)
-def fetch_btc():
-    url = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
-    response = requests.get(
-        url,
+def get_btc_candles():
+    data = fetch_json(
+        f"{COINBASE_API}/products/BTC-USD/candles",
         params={"granularity": 60},
-        headers=HEADERS,
-        timeout=12
     )
-    response.raise_for_status()
 
-    rows = response.json()
-    if not rows:
-        raise ValueError("Coinbase no devolvió velas de BTC.")
+    if not isinstance(data, list) or len(data) < 30:
+        raise RuntimeError("Coinbase no devolvió suficientes velas.")
 
     df = pd.DataFrame(
-        rows,
-        columns=["time", "low", "high", "open", "close", "volume"]
+        data,
+        columns=["time", "low", "high", "open", "close", "volume"],
     )
+
     df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
 
-    for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+    for column in ["open", "high", "low", "close", "volume"]:
+        df[column] = pd.to_numeric(df[column], errors="coerce")
 
     return (
-        df.dropna()
-        .drop_duplicates("time")
-        .sort_values("time")
-        .tail(350)
+        df.sort_values("time")
+        .tail(120)
+        .dropna(subset=["close"])
         .reset_index(drop=True)
     )
 
 
-@st.cache_data(ttl=20, show_spinner=False)
-def fetch_eurusd():
-    url = "https://query1.finance.yahoo.com/v8/finance/chart/EURUSD=X"
-    response = requests.get(
-        url,
-        params={"range": "1d", "interval": "1m"},
-        headers={"User-Agent": "Mozilla/5.0"},
-        timeout=12
+# =====================================================
+# EUR/USD: BIQUOTE, SIN API KEY
+# =====================================================
+@st.cache_data(ttl=5, show_spinner=False)
+def get_eurusd_candles():
+    data = fetch_json(
+        f"{BIQUOTE_API}/EURUSD/ohlc",
+        params={"interval": "1m", "limit": 120},
     )
-    response.raise_for_status()
 
-    results = response.json()["chart"]["result"]
-    if not results:
-        raise ValueError("Yahoo Finance no devolvió EUR/USD.")
+    bars = data.get("bars") if isinstance(data, dict) else None
+    if not bars:
+        raise RuntimeError(
+            "El proveedor EUR/USD no devolvió velas. "
+            "Puede estar caído o haber cambiado su API."
+        )
 
-    result = results[0]
-    quote = result["indicators"]["quote"][0]
-    timestamps = result.get("timestamp", [])
+    df = pd.DataFrame(bars)
 
-    df = pd.DataFrame({
-        "time": pd.to_datetime(timestamps, unit="s", utc=True),
-        "open": quote["open"],
-        "high": quote["high"],
-        "low": quote["low"],
-        "close": quote["close"],
-        "volume": quote.get("volume", [None] * len(timestamps))
-    })
+    required = ["openTime", "open", "high", "low", "close"]
+    missing = [column for column in required if column not in df.columns]
 
-    for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+    if missing:
+        raise RuntimeError(
+            "Formato inesperado de EUR/USD; faltan: "
+            + ", ".join(missing)
+        )
 
-    return (
-        df.dropna(subset=["open", "high", "low", "close"])
-        .drop_duplicates("time")
-        .sort_values("time")
-        .tail(350)
+    df["time"] = pd.to_datetime(
+        df["openTime"], utc=True, errors="coerce"
+    )
+
+    for column in ["open", "high", "low", "close"]:
+        df[column] = pd.to_numeric(df[column], errors="coerce")
+
+    df = (
+        df.sort_values("time")
+        .dropna(subset=["time", "open", "high", "low", "close"])
+        .tail(120)
         .reset_index(drop=True)
     )
+
+    if len(df) < 30:
+        raise RuntimeError("Hay menos de 30 velas válidas de EUR/USD.")
+
+    return df
 
 
 # =====================================================
 # INDICADORES TÉCNICOS
 # =====================================================
-def calculate_rsi(close, period=14):
-    delta = close.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-
-    avg_gain = gain.ewm(
-        alpha=1 / period, min_periods=period, adjust=False
-    ).mean()
-    avg_loss = loss.ewm(
-        alpha=1 / period, min_periods=period, adjust=False
-    ).mean()
-
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    return (100 - 100 / (1 + rs)).fillna(50)
-
-
-def indicators(df):
+def add_indicators(df):
     df = df.copy()
-    close = df["close"]
+    close = df["close"].astype(float)
 
-    for period in [9, 21, 50, 200]:
-        df[f"ema{period}"] = close.ewm(
-            span=period, adjust=False
-        ).mean()
+    df["ema9"] = close.ewm(span=9, adjust=False).mean()
+    df["ema21"] = close.ewm(span=21, adjust=False).mean()
+    df["ema50"] = close.ewm(span=50, adjust=False).mean()
 
-    df["rsi"] = calculate_rsi(close)
+    delta = close.diff()
+    gains = delta.clip(lower=0).ewm(
+        alpha=1 / 14, adjust=False
+    ).mean()
+    losses = (-delta.clip(upper=0)).ewm(
+        alpha=1 / 14, adjust=False
+    ).mean()
+
+    rs = gains / losses.replace(0, np.nan)
+    df["rsi"] = (100 - (100 / (1 + rs))).fillna(50)
 
     ema12 = close.ewm(span=12, adjust=False).mean()
     ema26 = close.ewm(span=26, adjust=False).mean()
-
     df["macd"] = ema12 - ema26
     df["macd_signal"] = df["macd"].ewm(
         span=9, adjust=False
     ).mean()
-    df["macd_hist"] = df["macd"] - df["macd_signal"]
-
-    mid = close.rolling(20).mean()
-    std = close.rolling(20).std(ddof=0)
-    df["bb_mid"] = mid
-    df["bb_upper"] = mid + 2 * std
-    df["bb_lower"] = mid - 2 * std
-
-    lowest = df["low"].rolling(14).min()
-    highest = df["high"].rolling(14).max()
-    spread = (highest - lowest).replace(0, np.nan)
-
-    df["stoch_k"] = (
-        100 * (close - lowest) / spread
-    ).fillna(50)
-    df["stoch_d"] = df["stoch_k"].rolling(3).mean().fillna(50)
-
-    previous_close = close.shift(1)
-    tr = pd.concat([
-        df["high"] - df["low"],
-        (df["high"] - previous_close).abs(),
-        (df["low"] - previous_close).abs()
-    ], axis=1).max(axis=1)
-
-    atr = tr.ewm(
-        alpha=1 / 14, min_periods=14, adjust=False
-    ).mean()
-
-    up = df["high"].diff()
-    down = -df["low"].diff()
-
-    plus_dm = pd.Series(
-        np.where((up > down) & (up > 0), up, 0),
-        index=df.index
-    )
-    minus_dm = pd.Series(
-        np.where((down > up) & (down > 0), down, 0),
-        index=df.index
-    )
-
-    plus_di = 100 * plus_dm.ewm(
-        alpha=1 / 14, min_periods=14, adjust=False
-    ).mean() / atr.replace(0, np.nan)
-
-    minus_di = 100 * minus_dm.ewm(
-        alpha=1 / 14, min_periods=14, adjust=False
-    ).mean() / atr.replace(0, np.nan)
-
-    dx = 100 * (plus_di - minus_di).abs() / (
-        plus_di + minus_di
-    ).replace(0, np.nan)
-
-    df["atr"] = atr
-    df["plus_di"] = plus_di
-    df["minus_di"] = minus_di
-    df["adx"] = dx.ewm(
-        alpha=1 / 14, min_periods=14, adjust=False
-    ).mean()
 
     df["momentum3"] = close.pct_change(3) * 100
-    df["momentum5"] = close.pct_change(5) * 100
+    df["momentum1"] = close.pct_change() * 100
 
-    return df.replace([np.inf, -np.inf], np.nan)
-
-
-# =====================================================
-# CONFIRMACIÓN DE 5 MINUTOS
-# =====================================================
-def trend_5m(df):
-    indexed = df.set_index("time").sort_index()
-
-    bars = indexed.resample("5min").agg({
-        "open": "first",
-        "high": "max",
-        "low": "min",
-        "close": "last",
-        "volume": "sum"
-    }).dropna(subset=["open", "high", "low", "close"])
-
-    if len(bars) < 30:
-        return "UNKNOWN"
-
-    bars = indicators(bars.reset_index())
-    last = bars.iloc[-1]
-
-    if last["ema9"] > last["ema21"] and last["close"] > last["ema50"]:
-        return "UP"
-    if last["ema9"] < last["ema21"] and last["close"] < last["ema50"]:
-        return "DOWN"
-
-    return "MIXED"
+    return df
 
 
 # =====================================================
-# SEÑAL TEMPRANA CON FILTROS
+# SEÑALES RÁPIDAS UP / DOWN
 # =====================================================
-def signal_engine(df, threshold, adx_min):
-    ready = df.dropna(subset=[
-        "ema9", "ema21", "ema50", "ema200", "rsi",
-        "macd", "macd_signal", "macd_hist",
-        "adx", "plus_di", "minus_di", "stoch_k",
-        "stoch_d", "momentum3", "momentum5"
-    ]).reset_index(drop=True)
-
-    if len(ready) < 205:
-        return {
-            "signal": "WAIT",
-            "score": 0,
-            "trend": "UNKNOWN",
-            "reasons": ["Esperando suficientes datos para confirmar indicadores."]
-        }
-
-    last = ready.iloc[-1]
-    prev = ready.iloc[-2]
-    trend = trend_5m(df)
+def make_signal(df, seconds_left=None):
+    row = df.iloc[-1]
+    previous = df.iloc[-2]
 
     score = 0
     reasons = []
 
-    # Tendencia
-    for condition, points, description in [
-        (last["ema9"] > last["ema21"], 1, "EMA 9 > EMA 21"),
-        (last["close"] > last["ema50"], 1, "Precio > EMA 50"),
-        (last["close"] > last["ema200"], 1, "Precio > EMA 200"),
-    ]:
-        if condition:
-            score += points
-            reasons.append(description)
+    # EMA rápida
+    if row["ema9"] > row["ema21"]:
+        score += 1
+        reasons.append("EMA 9 sobre EMA 21")
+    else:
+        score -= 1
+        reasons.append("EMA 9 debajo de EMA 21")
 
-    if last["ema9"] < last["ema21"]:
+    # Tendencia general
+    if row["ema21"] > row["ema50"]:
+        score += 1
+        reasons.append("Tendencia media alcista")
+    else:
         score -= 1
-        reasons.append("EMA 9 < EMA 21")
-    if last["close"] < last["ema50"]:
-        score -= 1
-        reasons.append("Precio < EMA 50")
-    if last["close"] < last["ema200"]:
-        score -= 1
-        reasons.append("Precio < EMA 200")
+        reasons.append("Tendencia media bajista")
 
     # MACD
-    if last["macd"] > last["macd_signal"] and last["macd_hist"] > prev["macd_hist"]:
+    if row["macd"] > row["macd_signal"]:
         score += 1
-        reasons.append("MACD alcista y mejorando")
-    elif last["macd"] < last["macd_signal"] and last["macd_hist"] < prev["macd_hist"]:
-        score -= 1
-        reasons.append("MACD bajista y empeorando")
-
-    # RSI
-    if 50 < last["rsi"] < 70:
-        score += 1
-        reasons.append("RSI alcista sin sobrecompra extrema")
-    elif 30 < last["rsi"] < 50:
-        score -= 1
-        reasons.append("RSI bajista")
-
-    # Estocástico
-    if last["stoch_k"] > last["stoch_d"] and last["stoch_k"] < 80:
-        score += 1
-        reasons.append("Estocástico alcista")
-    elif last["stoch_k"] < last["stoch_d"] and last["stoch_k"] > 20:
-        score -= 1
-        reasons.append("Estocástico bajista")
-
-    # Momentum
-    if last["momentum3"] > 0 and last["momentum5"] > 0:
-        score += 1
-        reasons.append("Momentum positivo")
-    elif last["momentum3"] < 0 and last["momentum5"] < 0:
-        score -= 1
-        reasons.append("Momentum negativo")
-
-    # Filtros estrictos
-    long_ok = (
-        score >= threshold
-        and trend == "UP"
-        and last["adx"] >= adx_min
-        and last["plus_di"] > last["minus_di"]
-        and 50 < last["rsi"] < 70
-    )
-
-    short_ok = (
-        score <= -threshold
-        and trend == "DOWN"
-        and last["adx"] >= adx_min
-        and last["minus_di"] > last["plus_di"]
-        and 30 < last["rsi"] < 50
-    )
-
-    if long_ok:
-        signal = "BUY UP"
-    elif short_ok:
-        signal = "BUY DOWN"
+        reasons.append("MACD alcista")
     else:
-        signal = "WAIT"
+        score -= 1
+        reasons.append("MACD bajista")
 
-    reasons.append(f"Tendencia 5 min: {trend}")
-    reasons.append(f"ADX: {last['adx']:.1f}")
-    reasons.append(f"RSI: {last['rsi']:.1f}")
+    # Impulso
+    if row["momentum3"] > 0:
+        score += 1
+        reasons.append("Impulso reciente positivo")
+    else:
+        score -= 1
+        reasons.append("Impulso reciente negativo")
 
-    return {
-        "signal": signal,
-        "score": int(score),
-        "trend": trend,
-        "reasons": reasons,
-        "last": last
-    }
+    # Cruces de EMA
+    bearish_cross = (
+        previous["ema9"] >= previous["ema21"]
+        and row["ema9"] < row["ema21"]
+    )
+    bullish_cross = (
+        previous["ema9"] <= previous["ema21"]
+        and row["ema9"] > row["ema21"]
+    )
 
+    rsi = float(row["rsi"])
+    reasons.append(f"RSI: {rsi:.1f}")
 
-# =====================================================
-# PANTALLA: CONTRATO KALSHI
-# =====================================================
-st.subheader(f"Kalshi · {market_name}")
-st.caption(f"Serie consultada: {series_ticker}")
-
-try:
-    contracts = fetch_kalshi_series(series_ticker)
-
-    if contracts:
-        labels = [
-            f"{m.get('ticker', 'Sin ticker')} · cierre "
-            f"{m.get('close_time', 'N/D')}"
-            for m in contracts
+    # Evitar señales de entrada demasiado cerca del cierre.
+    if seconds_left is not None and seconds_left < 30:
+        return "ESPERAR", score, reasons + [
+            "Quedan menos de 30 segundos para el cierre."
         ]
 
-        selected_index = st.selectbox(
-            "Contrato activo detectado",
-            range(len(contracts)),
-            format_func=lambda i: labels[i]
+    # Umbral más rápido: +/-2 en lugar de +/-3.
+    if score <= -2:
+        signal = "COMPRAR DOWN"
+    elif score >= 2:
+        signal = "COMPRAR UP"
+    elif score == -1:
+        signal = "POSIBLE CAÍDA"
+    elif score == 1:
+        signal = "POSIBLE SUBIDA"
+    else:
+        signal = "ESPERAR"
+
+    # Un cruce contrario muestra aviso de posible giro.
+    if bearish_cross:
+        reasons.append("🔔 ALERTA: cruce reciente hacia bajada")
+        if signal != "COMPRAR DOWN":
+            signal = "POSIBLE CAÍDA"
+
+    if bullish_cross:
+        reasons.append("🔔 ALERTA: cruce reciente hacia subida")
+        if signal != "COMPRAR UP":
+            signal = "POSIBLE SUBIDA"
+
+    return signal, score, reasons
+
+
+# =====================================================
+# INTERFAZ DE CADA ACTIVO
+# =====================================================
+def show_asset(title, series, loader, formatter):
+    st.subheader(title)
+
+    market = None
+    try:
+        market = get_market(series)
+    except Exception as exc:
+        st.warning(f"Error consultando Kalshi: {exc}")
+
+    try:
+        df = add_indicators(loader())
+    except Exception as exc:
+        st.error(f"Error cargando la gráfica: {exc}")
+        st.info(
+            "Comprueba tu conexión. Si es EUR/USD, el proveedor "
+            "puede no estar respondiendo o haber cambiado su formato."
         )
-        contract = contracts[selected_index]
+        return
 
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Estado", contract.get("status", "N/D"))
-        col2.metric("Tiempo hasta cierre", format_time_remaining(
-            contract.get("close_time")
-        ))
-        col3.metric("YES ask", dollars(contract.get("yes_ask_dollars")))
+    seconds_left = None
 
-        d1, d2, d3 = st.columns(3)
-        d1.metric("NO ask", dollars(contract.get("no_ask_dollars")))
-        d2.metric("YES bid", dollars(contract.get("yes_bid_dollars")))
-        d3.metric("NO bid", dollars(contract.get("no_bid_dollars")))
+    if market:
+        seconds_left = max(
+            0, int(market["_close_ts"] - time.time())
+        )
 
-        st.write("**Ticker del contrato:**", contract.get("ticker", "N/D"))
-        st.write("**Pregunta:**", contract.get("title", "No disponible"))
-        st.write("**YES significa:**", contract.get("yes_sub_title", "Ver reglas del contrato"))
-        st.write("**Reglas:**", contract.get("rules_primary", "Consultar la página de Kalshi"))
+        st.markdown("### Mercado de Kalshi")
+        st.write("**Título:**", market.get("title", "No disponible"))
+        st.write("**Ticker:**", market.get("ticker", "No disponible"))
 
+        st.metric(
+            "Cuenta regresiva",
+            f"{seconds_left // 60:02d}:{seconds_left % 60:02d}",
+        )
+
+        probability = get_yes_probability(market)
+
+        if np.isfinite(probability):
+            st.metric("YES / UP implícito", f"{probability:.1f}%")
+            st.metric("NO / DOWN implícito", f"{100-probability:.1f}%")
+        else:
+            st.info("No hay cotización disponible para calcular la probabilidad.")
+
+        columns = st.columns(4)
+
+        quote_fields = [
+            ("YES bid", ("yes_bid_dollars", "yes_bid")),
+            ("YES ask", ("yes_ask_dollars", "yes_ask")),
+            ("NO bid", ("no_bid_dollars", "no_bid")),
+            ("NO ask", ("no_ask_dollars", "no_ask")),
+        ]
+
+        for column, (label, fields) in zip(columns, quote_fields):
+            value = price_cents(market, *fields)
+            column.metric(
+                label,
+                f"{value:.1f}¢" if np.isfinite(value) else "N/D",
+            )
+
+        st.write("**Strike detectado:**", get_strike(market))
         st.caption(
-            "El contrato y sus precios proceden de la API pública. "
-            "Verifica las reglas antes de interpretar YES como UP o NO como DOWN."
+            "Verifica las reglas del contrato: el strike mostrado "
+            "no necesariamente describe toda la liquidación."
         )
     else:
-        contract = None
         st.warning(
-            "La API no devolvió un contrato abierto para esta serie en este momento. "
-            "No se recomienda operar hasta verificar el mercado en Kalshi."
+            f"No se encontró un contrato abierto para {series}. "
+            "La gráfica de referencia puede seguir funcionando, "
+            "pero no confirma un contrato activo."
         )
 
-except requests.RequestException as e:
-    contract = None
-    st.error(f"No se pudo consultar Kalshi: {e}")
+    signal, score, reasons = make_signal(df, seconds_left)
 
-# =====================================================
-# ANÁLISIS DEL ACTIVO
-# =====================================================
-st.divider()
-st.subheader(f"Indicadores técnicos · {market_name}")
+    st.markdown("### Señal del bot")
 
-try:
-    with st.spinner("Descargando datos y calculando indicadores..."):
-        raw = fetch_btc() if market_name == "BTC/USD" else fetch_eurusd()
-        df = indicators(raw)
+    if signal == "COMPRAR UP":
+        st.success("🟢 " + signal)
+    elif signal == "COMPRAR DOWN":
+        st.error("🔴 " + signal)
+    elif signal.startswith("POSIBLE"):
+        st.warning("🟡 " + signal)
+    else:
+        st.info("⚪ " + signal)
 
-    result = signal_engine(df, min_score, min_adx)
-    last = result.get("last", df.iloc[-1])
+    last = df.iloc[-1]
+    c1, c2, c3 = st.columns(3)
 
-    a, b, c, d = st.columns(4)
-    a.metric("Precio del activo", f"{last['close']:,.5f}")
-    b.metric("RSI", f"{last['rsi']:.1f}" if "rsi" in last else "N/D")
-    b.metric("ADX", f"{last['adx']:.1f}" if "adx" in last else "N/D")
-    c.metric("EMA 9", f"{last['ema9']:,.5f}")
-    d.metric("Tendencia 5 min", result["trend"])
+    c1.metric("Precio de referencia", formatter(float(last["close"])))
+    c2.metric("Puntuación técnica", f"{score:+d} / 4")
+    c3.metric("RSI", f"{last['rsi']:.1f}")
 
-    st.markdown(
-        f'<div class="signal">{result["signal"]}</div>',
-        unsafe_allow_html=True
-    )
-    st.write(f"**Puntuación:** {result['score']}")
-    st.write("**Confirmaciones y filtros:**")
-    for reason in result["reasons"]:
-        st.write(f"- {reason}")
+    st.markdown("**Motivos de la señal**")
+    for reason in reasons:
+        st.write("• " + reason)
 
-    # Gráfico de velas
+    # Aviso visible si cambia la señal entre actualizaciones.
+    state_key = f"previous_signal_{series}"
+    old_signal = st.session_state.get(state_key)
+
+    if old_signal is not None and old_signal != signal:
+        st.warning(f"🔔 CAMBIO DE SEÑAL: {old_signal} → {signal}")
+
+    st.session_state[state_key] = signal
+
+    # Gráfica de velas y medias móviles.
     fig = go.Figure()
-    fig.add_trace(go.Candlestick(
-        x=df["time"], open=df["open"], high=df["high"],
-        low=df["low"], close=df["close"], name="Precio"
-    ))
 
-    for col, label in [
-        ("ema9", "EMA 9"),
-        ("ema21", "EMA 21"),
-        ("ema50", "EMA 50"),
-        ("ema200", "EMA 200")
-    ]:
-        fig.add_trace(go.Scatter(
-            x=df["time"], y=df[col], name=label, mode="lines"
-        ))
+    fig.add_trace(
+        go.Candlestick(
+            x=df["time"],
+            open=df["open"],
+            high=df["high"],
+            low=df["low"],
+            close=df["close"],
+            name="Precio",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(x=df["time"], y=df["ema9"], name="EMA 9")
+    )
+    fig.add_trace(
+        go.Scatter(x=df["time"], y=df["ema21"], name="EMA 21")
+    )
+    fig.add_trace(
+        go.Scatter(x=df["time"], y=df["ema50"], name="EMA 50")
+    )
 
     fig.update_layout(
-        template="plotly_dark",
-        paper_bgcolor="#10091f",
-        plot_bgcolor="#10091f",
-        height=500,
-        xaxis_rangeslider_visible=False
+        height=430,
+        xaxis_rangeslider_visible=False,
+        margin=dict(l=5, r=5, t=25, b=5),
+        legend=dict(orientation="h"),
     )
+
     st.plotly_chart(fig, use_container_width=True)
 
-    # RSI
-    rsi_fig = go.Figure()
-    rsi_fig.add_trace(go.Scatter(
-        x=df["time"], y=df["rsi"], name="RSI 14", mode="lines"
-    ))
-    rsi_fig.add_hline(y=70, line_dash="dash")
-    rsi_fig.add_hline(y=30, line_dash="dash")
-    rsi_fig.update_layout(
-        template="plotly_dark",
-        paper_bgcolor="#10091f",
-        plot_bgcolor="#10091f",
-        height=220,
-        yaxis=dict(range=[0, 100])
-    )
-    st.plotly_chart(rsi_fig, use_container_width=True)
-
-    # =================================================
-    # COMPROBACIÓN DEL PRECIO DEL CONTRATO
-    # =================================================
-    st.divider()
-    st.subheader("Revisión de la entrada")
-
-    if not contract:
-        st.warning(
-            "No hay contrato activo verificado; la señal técnica no debe "
-            "interpretarse como una orden de entrada en Kalshi."
-        )
-    else:
-        side = "YES" if result["signal"] == "BUY UP" else (
-            "NO" if result["signal"] == "BUY DOWN" else None
-        )
-
-        st.write(
-            "**Lado candidato:** "
-            + (side if side else "Ninguno — WAIT")
-        )
-
-        if side == "YES":
-            candidate_price = contract.get("yes_ask_dollars")
-        elif side == "NO":
-            candidate_price = contract.get("no_ask_dollars")
-        else:
-            candidate_price = None
-
-        if candidate_price is not None and side:
-            try:
-                price = float(candidate_price)
-                st.metric("Precio de compra estimado", f"${price:.2f}")
-
-                if price > max_entry_price:
-                    st.warning(
-                        "El precio supera tu límite. No se considera una "
-                        "entrada aceptable según tu filtro."
-                    )
-                else:
-                    st.info(
-                        "El precio está dentro de tu límite, pero eso no "
-                        "demuestra que exista ventaja estadística."
-                    )
-            except (TypeError, ValueError):
-                st.warning("Kalshi no publicó un precio de compra válido.")
-
     st.caption(
-        "BUY UP/DOWN es una estimación de dirección técnica. No es una "
-        "probabilidad validada de ganar el contrato. No se envían órdenes."
+        "BTC usa Coinbase; EUR/USD usa Biquote. Estas referencias "
+        "pueden diferir del índice de liquidación de Kalshi. "
+        "La caché y el proveedor pueden retrasar los datos."
     )
 
-except requests.RequestException as e:
-    st.error(f"Error descargando datos del activo: {e}")
-except (KeyError, ValueError, IndexError, TypeError) as e:
-    st.error(f"Datos insuficientes o formato inesperado: {e}")
-except Exception as e:
-    st.error(f"Error inesperado: {e}")
+
+# =====================================================
+# PESTAÑAS PRINCIPALES
+# =====================================================
+tab_btc, tab_eur = st.tabs(["₿ BITCOIN", "💱 EUR/USD"])
+
+with tab_btc:
+    show_asset(
+        "Bitcoin (BTC/USD)",
+        "KXBTC15M",
+        get_btc_candles,
+        lambda price: f"${price:,.2f}",
+    )
+
+with tab_eur:
+    show_asset(
+        "EUR/USD",
+        "KXEURUSD15M",
+        get_eurusd_candles,
+        lambda price: f"{price:.5f}",
+    )
+
+st.divider()
+st.caption(
+    "Modo informativo: no ejecuta órdenes. Las reglas técnicas "
+    "no han sido validadas mediante backtesting. Una señal DOWN "
+    "no garantiza que el contrato vaya a ganar."
+)
