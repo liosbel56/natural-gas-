@@ -13,7 +13,7 @@ from streamlit_autorefresh import st_autorefresh
 # CONFIGURACIÓN
 # =====================================================
 st.set_page_config(
-    page_title="Kalshi Early Signal Bot",
+    page_title="COSITA RICA MIA💜",
     page_icon="📈",
     layout="wide"
 )
