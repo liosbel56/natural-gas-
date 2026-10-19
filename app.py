@@ -3,102 +3,118 @@ import streamlit as st
 import requests
 from datetime import datetime, timezone
 
-st.set_page_config(
-    page_title="Natural Gas | Kalshi Signal Bot",
-    page_icon="📈",
-    layout="wide"
-)
+st.set_page_config(page_title="NATGAS 15M Bot", page_icon="📈")
 
-st.title("📈 Natural Gas — Kalshi Signal Bot")
-st.caption("Panel de análisis de 15 minutos · Solo señales, sin órdenes automáticas")
+API = "https://api.elections.kalshi.com/trade-api/v2"
 
-st.warning(
-    "Esta versión consulta mercados públicos de Kalshi cuando están disponibles. "
-    "No garantiza predicciones ni representa una conexión a precios de futuros "
-    "en tiempo real. Las señales requieren datos suficientes."
-)
+st.title("NATGAS 15 MIN")
+st.caption("Monitor experimental de Kalshi")
 
-API_URL = "https://api.elections.kalshi.com/trade-api/v2/markets"
+if st.button("🔄 Buscar mercado activo", type="primary"):
+    st.session_state["buscar"] = True
 
-if st.button("🔄 Buscar mercados de Natural Gas"):
-    st.session_state["search_markets"] = True
+if st.session_state.get("buscar", False):
+    try:
+        response = requests.get(
+            f"{API}/markets",
+            params={
+                "series_ticker": "KXNATGAS15M",
+                "status": "open",
+                "limit": 100,
+            },
+            timeout=15,
+        )
+        response.raise_for_status()
+        markets = response.json().get("markets", [])
 
-if st.session_state.get("search_markets", False):
-    with st.spinner("Consultando mercados públicos..."):
-        try:
-            response = requests.get(
-                API_URL,
-                params={"status": "open", "limit": 200},
-                timeout=15
+        now = datetime.now(timezone.utc)
+        active = []
+
+        for market in markets:
+            close_text = market.get("close_time")
+            if not close_text:
+                continue
+
+            close_time = datetime.fromisoformat(
+                close_text.replace("Z", "+00:00")
             )
-            response.raise_for_status()
-            payload = response.json()
-            markets = payload.get("markets", [])
 
-            gas_markets = [
-                market for market in markets
-                if "natural gas" in (
-                    str(market.get("title", "")) + " " +
-                    str(market.get("subtitle", "")) + " " +
-                    str(market.get("ticker", ""))
-                ).lower()
-            ]
+            if close_time > now:
+                active.append((close_time, market))
 
-            if gas_markets:
-                st.success(f"Mercados encontrados: {len(gas_markets)}")
-                for market in gas_markets:
-                    with st.container(border=True):
-                        st.subheader(
-                            market.get("title")
-                            or market.get("subtitle")
-                            or market.get("ticker", "Mercado")
-                        )
-                        st.write("Ticker:", market.get("ticker", "No disponible"))
-                        st.write(
-                            "Precio YES:",
-                            market.get("yes_ask", "No disponible")
-                        )
-                        st.write(
-                            "Precio NO:",
-                            market.get("no_ask", "No disponible")
-                        )
-                        st.write(
-                            "Cierre:",
-                            market.get("close_time", "No disponible")
-                        )
-            else:
+        if not active:
+            st.warning(
+                "No se encontró una ronda abierta. "
+                "Puede ser una pausa del mercado o de la API."
+            )
+            st.info("Vuelve a intentarlo en unos segundos.")
+
+        else:
+            close_time, market = min(active, key=lambda x: x[0])
+            ticker = market.get("ticker", "No disponible")
+
+            seconds_left = max(
+                0, int((close_time - now).total_seconds())
+            )
+            elapsed = max(0, 900 - seconds_left)
+            minute = min(15, elapsed // 60)
+
+            st.success("Contrato activo detectado")
+            st.write("**Contrato:**", ticker)
+            st.write("**Minutos transcurridos:**", f"{minute}/15")
+            st.write(
+                "**Tiempo restante:**",
+                f"{seconds_left // 60} min {seconds_left % 60} s",
+            )
+            st.write(
+                "**Precio objetivo de apertura:**",
+                market.get("floor_strike", "No publicado"),
+            )
+
+            yes_ask = market.get("yes_ask")
+            no_ask = market.get("no_ask")
+
+            st.subheader("Análisis de la ronda")
+
+            if yes_ask is not None:
+                st.metric("Comprar YES (centavos)", yes_ask)
+            if no_ask is not None:
+                st.metric("Comprar NO (centavos)", no_ask)
+
+            if minute < 9:
                 st.info(
-                    "No se encontraron mercados abiertos con el nombre "
-                    "'Natural Gas' en los primeros resultados. Esto no "
-                    "significa que no exista uno. Busca también en Kalshi."
+                    "ANALIZANDO: espera al minuto 9. "
+                    "Todavía no hay señal."
+                )
+            elif yes_ask is None or no_ask is None:
+                st.warning(
+                    "NO OPERAR: faltan precios de compra válidos."
+                )
+            elif yes_ask >= 60 and yes_ask < 100:
+                st.success(
+                    "SEÑAL EXPERIMENTAL: el mercado favorece YES."
+                )
+                st.caption(
+                    "No confirma que el precio de Natural Gas vaya a subir."
+                )
+            elif no_ask >= 60 and no_ask < 100:
+                st.error(
+                    "SEÑAL EXPERIMENTAL: el mercado favorece NO."
+                )
+                st.caption(
+                    "No confirma que el precio de Natural Gas vaya a bajar."
+                )
+            else:
+                st.warning(
+                    "NO OPERAR: no hay una ventaja clara con este filtro."
                 )
 
-        except requests.RequestException as error:
-            st.error(f"No se pudo consultar la API pública: {error}")
-        except (ValueError, TypeError):
-            st.error("La respuesta recibida no tenía el formato esperado.")
+            st.caption(
+                "La señal usa precios de Kalshi, no un modelo predictivo "
+                "validado. Comprueba el contrato y sus reglas antes de operar."
+            )
 
-st.divider()
-st.subheader("⏱️ Ciclo de análisis de 15 minutos")
-
-now = datetime.now(timezone.utc)
-minute = now.minute % 15
-remaining = 15 - minute
-
-col1, col2, col3 = st.columns(3)
-col1.metric("Minuto del ciclo", f"{minute}/15")
-col2.metric("Minutos restantes", remaining)
-col3.metric("Hora UTC", now.strftime("%H:%M:%S"))
-
-if minute < 9:
-    st.info("FASE: recopilación y análisis. Todavía no hay señal automática.")
-elif minute < 15:
-    st.info(
-        "FASE: seguimiento. No se genera BUY UP o BUY DOWN sin datos "
-        "de precio e historial suficientes."
-    )
-
-st.caption(
-    "Este panel es una primera versión. No calcula todavía una probabilidad "
-    "predictiva validada ni ejecuta operaciones."
-)
+    except requests.RequestException as error:
+        st.error(f"Error conectando con Kalshi: {error}")
+    except (ValueError, TypeError, KeyError) as error:
+        st.error(f"Error leyendo los datos del mercado: {error}")
