@@ -14,7 +14,7 @@ st.set_page_config(
 BIQUOTE = "https://biquote.io/api"
 COINBASE = "https://api.exchange.coinbase.com"
 
-# ===== ESTILO MORADO =====
+# ============ DISEÑO MORADO ============
 st.markdown("""
 <style>
 .stApp {
@@ -22,15 +22,14 @@ st.markdown("""
     color: #f5eaff;
 }
 header[data-testid="stHeader"] {
-    background: rgba(16, 0, 43, 0.9);
+    background: rgba(16,0,43,0.9);
 }
 .block-container {
-    padding-top: 1.5rem;
+    padding-top: 1.3rem;
     max-width: 1400px;
 }
-div[data-testid="stMetric"],
-div[data-testid="stSelectbox"] {
-    background: rgba(62, 15, 112, 0.55);
+div[data-testid="stMetric"] {
+    background: rgba(62,15,112,0.55);
     border: 1px solid #7b2cff;
     border-radius: 14px;
     padding: 12px;
@@ -38,16 +37,54 @@ div[data-testid="stSelectbox"] {
 h1, h2, h3, p, label {
     color: #f5eaff !important;
 }
-div[data-testid="stAlert"] {
-    border-radius: 14px;
-}
 </style>
 """, unsafe_allow_html=True)
 
 st.title("📈 TRADING SIGNALS BOT")
-st.caption("BTC/USD + EUR/USD | Análisis técnico de 15 minutos")
+st.caption("BTC/USD + EUR/USD | Señales técnicas de 15 minutos")
 
 
+# ============ CONTADOR ============
+@st.fragment(run_every="1s")
+def show_countdown():
+    now = datetime.now(timezone.utc)
+    elapsed = (now.minute % 15) * 60 + now.second
+    remaining = 900 - elapsed
+    mm, ss = divmod(remaining, 60)
+
+    st.markdown(
+        f"""
+        <div style="
+            background:linear-gradient(135deg,#240046,#3c096c);
+            border:2px solid #9d4edd;
+            border-radius:18px;
+            padding:15px;
+            text-align:center;
+            margin:12px 0 20px 0;
+            box-shadow:0 0 16px #7b2cff55;
+        ">
+            <div style="color:#e0aaff;font-size:15px;">
+                ⏳ TIEMPO PARA CERRAR LA VELA
+            </div>
+            <div style="
+                color:white;
+                font-size:clamp(42px,10vw,60px);
+                font-weight:900;
+                line-height:1.3;
+            ">{mm:02d}:{ss:02d}</div>
+            <div style="color:#e0aaff;font-size:12px;">
+                Vela de 15 minutos · UTC
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+
+show_countdown()
+
+
+# ============ PETICIONES ============
 def get_json(url, params=None):
     response = requests.get(
         url,
@@ -70,13 +107,10 @@ def get_eurusd_candles(interval):
         raise ValueError("BiQuote no devolvió velas EUR/USD.")
 
     df = pd.DataFrame(bars)
-
     if "openTime" not in df.columns:
-        raise ValueError("Falta openTime en EUR/USD.")
+        raise ValueError("Falta openTime en los datos EUR/USD.")
 
-    df["openTime"] = pd.to_datetime(
-        df["openTime"], utc=True
-    )
+    df["openTime"] = pd.to_datetime(df["openTime"], utc=True)
     df = df.set_index("openTime").sort_index()
 
     if "isOpen" in df.columns:
@@ -85,9 +119,7 @@ def get_eurusd_candles(interval):
     for col in ["open", "high", "low", "close"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    return df.dropna(
-        subset=["open", "high", "low", "close"]
-    )
+    return df.dropna(subset=["open", "high", "low", "close"])
 
 
 def get_btc_candles(granularity):
@@ -100,14 +132,12 @@ def get_btc_candles(granularity):
             ts, timezone.utc
         ).isoformat(timespec="seconds").replace("+00:00", "Z")
 
-    # Coinbase limita el número de velas por petición.
-    # Descargamos en bloques de 250 o menos.
     chunks = []
-    chunk_size = granularity * 250
     cursor = start_ts
+    chunk_seconds = granularity * 250
 
     while cursor < end_ts:
-        chunk_end = min(cursor + chunk_size, end_ts)
+        chunk_end = min(cursor + chunk_seconds, end_ts)
 
         data = get_json(
             f"{COINBASE}/products/BTC-USD/candles",
@@ -118,7 +148,7 @@ def get_btc_candles(granularity):
             }
         )
 
-        if isinstance(data, list) and data:
+        if isinstance(data, list):
             chunks.extend(data)
 
         cursor = chunk_end
@@ -128,33 +158,23 @@ def get_btc_candles(granularity):
 
     df = pd.DataFrame(
         chunks,
-        columns=[
-            "time", "low", "high", "open", "close", "volume"
-        ]
+        columns=["time", "low", "high", "open", "close", "volume"]
     )
-
     df = df.drop_duplicates(subset=["time"])
-    df["openTime"] = pd.to_datetime(
-        df["time"], unit="s", utc=True
-    )
-    df = df.set_index("openTime").sort_index()
 
-    # Solo velas cerradas
+    df["openTime"] = pd.to_datetime(df["time"], unit="s", utc=True)
+    df = df.set_index("openTime").sort_index()
     df = df[df.index.astype("int64") // 10**9 < end_ts]
 
     for col in ["open", "high", "low", "close"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    return df.dropna(
-        subset=["open", "high", "low", "close"]
-    )
+    return df.dropna(subset=["open", "high", "low", "close"])
 
 
 def get_price(market):
     if market == "BTC/USD":
-        data = get_json(
-            f"{COINBASE}/products/BTC-USD/ticker"
-        )
+        data = get_json(f"{COINBASE}/products/BTC-USD/ticker")
         return float(data["price"]), False
 
     data = get_json(f"{BIQUOTE}/EURUSD")
@@ -170,18 +190,15 @@ def get_price(market):
     return float(price), stale
 
 
+# ============ INDICADORES ============
 def add_indicators(df):
     df = df.copy()
     close = df["close"]
     high = df["high"]
     low = df["low"]
 
-    df["ema9"] = close.ewm(
-        span=9, adjust=False
-    ).mean()
-    df["ema21"] = close.ewm(
-        span=21, adjust=False
-    ).mean()
+    df["ema9"] = close.ewm(span=9, adjust=False).mean()
+    df["ema21"] = close.ewm(span=21, adjust=False).mean()
 
     delta = close.diff()
     gain = delta.clip(lower=0).ewm(
@@ -218,7 +235,6 @@ def add_indicators(df):
 
     up = high.diff()
     down = -low.diff()
-
     plus_dm = up.where((up > down) & (up > 0), 0.0)
     minus_dm = down.where((down > up) & (down > 0), 0.0)
 
@@ -282,52 +298,45 @@ def score_latest(df):
     return score
 
 
+# ============ SEÑAL GIGANTE ============
 def show_signal(signal):
     if signal == "BUY UP":
-        color = "#00ff9d"
-        background = "#062c27"
-        icon = "⬆️"
+        color, bg, icon = "#00ff9d", "#062c27", "⬆️"
         description = "POSIBLE MOVIMIENTO ALCISTA"
     elif signal == "BUY DOWN":
-        color = "#ff4268"
-        background = "#3b1028"
-        icon = "⬇️"
+        color, bg, icon = "#ff4268", "#3b1028", "⬇️"
         description = "POSIBLE MOVIMIENTO BAJISTA"
     else:
-        color = "#ffc857"
-        background = "#382508"
-        icon = "⏳"
+        color, bg, icon = "#ffc857", "#382508", "⏳"
         description = "ESPERANDO CONFIRMACIÓN"
 
     st.markdown(
         f"""
         <div style="
-            background:{background};
+            background:{bg};
             border:3px solid {color};
             box-shadow:0 0 18px {color}55;
             border-radius:20px;
-            padding:25px 8px;
+            padding:24px 8px;
             text-align:center;
-            margin:12px 0 20px 0;
+            margin:12px 0 20px;
         ">
           <div style="
               color:{color};
-              font-size:clamp(38px, 9vw, 62px);
+              font-size:clamp(38px,9vw,62px);
               font-weight:900;
               line-height:1.2;
           ">{icon} {signal}</div>
-          <div style="
-              color:white;
-              font-size:16px;
-              font-weight:700;
-              margin-top:12px;
-          ">{description}</div>
+          <div style="color:white;font-size:15px;font-weight:700;margin-top:12px;">
+            {description}
+          </div>
         </div>
         """,
         unsafe_allow_html=True
     )
 
 
+# ============ PANEL PRINCIPAL ============
 def render_bot(market):
     st.subheader(f"Mercado: {market}")
 
@@ -342,10 +351,7 @@ def render_bot(market):
         price, stale = get_price(market)
 
         if len(df1) < 60 or len(df15) < 60:
-            st.warning(
-                "No hay suficientes velas cerradas para calcular "
-                "los indicadores. Intenta más tarde."
-            )
+            st.warning("No hay suficientes velas cerradas todavía.")
             return
 
         df1 = add_indicators(df1)
@@ -356,22 +362,21 @@ def render_bot(market):
 
         if stale:
             signal = "ESPERAR"
-            explanation = "El precio de EUR/USD puede estar cerrado o desactualizado."
+            explanation = "Precio EUR/USD cerrado o posiblemente desactualizado."
         elif s15 >= 3 and s1 >= 1:
             signal = "BUY UP"
-            explanation = "Los indicadores favorecen una posible subida; no es garantía."
+            explanation = "Los indicadores favorecen una posible subida."
         elif s15 <= -3 and s1 <= -1:
             signal = "BUY DOWN"
-            explanation = "Los indicadores favorecen una posible bajada; no es garantía."
+            explanation = "Los indicadores favorecen una posible bajada."
         else:
             signal = "ESPERAR"
-            explanation = "Los indicadores no coinciden lo suficiente."
+            explanation = "Los indicadores no coinciden suficientemente."
 
         a, b = st.columns(2)
         a.metric(
             "PRECIO ACTUAL",
-            f"${price:,.2f}" if market == "BTC/USD"
-            else f"{price:.5f}"
+            f"${price:,.2f}" if market == "BTC/USD" else f"{price:.5f}"
         )
         b.metric("HORIZONTE", "15 minutos")
 
@@ -386,19 +391,12 @@ def render_bot(market):
         st.subheader("Indicadores de 15 minutos")
 
         a, b, c, d = st.columns(4)
-        a.metric(
-            "RSI (14)",
-            f"{row['rsi']:.1f}" if pd.notna(row["rsi"]) else "N/D"
-        )
+        a.metric("RSI", f"{row['rsi']:.1f}" if pd.notna(row["rsi"]) else "N/D")
         b.metric("MACD", f"{row['macd_hist']:.6f}")
-        c.metric(
-            "ADX (14)",
-            f"{row['adx']:.1f}" if pd.notna(row["adx"]) else "N/D"
-        )
+        c.metric("ADX", f"{row['adx']:.1f}" if pd.notna(row["adx"]) else "N/D")
         d.metric(
             "Bollinger",
-            "Sobre media" if row["close"] > row["bb_mid"]
-            else "Bajo media"
+            "Sobre media" if row["close"] > row["bb_mid"] else "Bajo media"
         )
 
         st.subheader(f"Gráfica de velas de 15 minutos — {market}")
@@ -431,27 +429,23 @@ def render_bot(market):
             height=430,
             margin=dict(l=5, r=5, t=25, b=5)
         )
-
         st.plotly_chart(fig, use_container_width=True)
 
         st.subheader("🤖 Análisis del bot")
         st.info(explanation)
 
-        st.markdown("#### Resumen de indicadores")
         checks = [
-            ("EMA 9 frente a EMA 21", row["ema9"] > row["ema21"]),
+            ("EMA 9 sobre EMA 21", row["ema9"] > row["ema21"]),
             ("MACD positivo", row["macd_hist"] > 0),
             ("Precio sobre media Bollinger", row["close"] > row["bb_mid"]),
-            ("ADX indica tendencia fuerte", row["adx"] >= 18 if pd.notna(row["adx"]) else False)
+            (
+                "ADX indica tendencia fuerte",
+                pd.notna(row["adx"]) and row["adx"] >= 18
+            )
         ]
 
         for label, passed in checks:
             st.write(f"{'✅' if passed else '▫️'} {label}")
-
-        st.caption(
-            "Las señales son estimaciones técnicas. Los precios pueden cambiar "
-            "y no se garantizan ganancias."
-        )
 
     except Exception as e:
         st.error("No se pudieron cargar los datos del mercado.")
@@ -473,6 +467,6 @@ live_panel(market)
 
 st.divider()
 st.caption(
-    "Bot experimental. No ejecuta operaciones automáticamente "
-    "ni garantiza resultados."
+    "Bot experimental. Las señales son estimaciones técnicas, "
+    "no garantizan resultados ni ejecutan operaciones."
 )
