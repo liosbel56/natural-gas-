@@ -1,4 +1,6 @@
-streamlit
+
+streamlit>=1.37.0
+streamlit-autorefresh
 requests
 pandas
 plotly
