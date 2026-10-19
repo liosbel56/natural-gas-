@@ -21,38 +21,35 @@ st.markdown("""
     color: white;
 }
 .block-container {max-width:1200px;padding-top:1.5rem}
-h1,h2,h3,p,label {color:#f5f0ff}
-.hero {
-    background:#211536;border:1px solid #7146a8;
-    border-radius:22px;padding:24px;margin-bottom:16px;
+.hero,.signal {
+    background:#211536;
+    border:1px solid #7146a8;
+    border-radius:18px;
+    padding:20px;
+    margin:12px 0;
 }
-.timer {
-    color:#ff334f;font-size:clamp(55px,10vw,88px);
-    font-weight:900;line-height:1.15;
-}
-.price {font-size:48px;font-weight:850;color:white}
+.timer {color:#ff334f;font-size:64px;font-weight:900}
+.price {font-size:42px;font-weight:850;color:white}
 .muted {color:#c1b5d7;font-size:13px}
-.signal {
-    background:#25193d;border:1px solid #8c67bd;
-    border-radius:18px;padding:20px;margin:12px 0;
-}
 </style>
 """, unsafe_allow_html=True)
 
 
 def get_json(url, params=None):
-    r = requests.get(url, params=params, timeout=TIMEOUT)
-    r.raise_for_status()
-    data = r.json()
+    response = requests.get(
+        url, params=params, timeout=TIMEOUT
+    )
+    response.raise_for_status()
+    data = response.json()
     if not isinstance(data, dict):
-        raise ValueError("La fuente devolvió un formato inesperado.")
+        raise ValueError("Formato de datos inesperado.")
     return data
 
 
 def quote_data():
     data = get_json(f"{API}/EURUSD")
     if data.get("symbol") != "EURUSD" or data.get("mid") is None:
-        raise ValueError("No llegó una cotización válida de EUR/USD.")
+        raise ValueError("Cotización EUR/USD no válida.")
     return data
 
 
@@ -61,22 +58,32 @@ def candle_data(interval):
         f"{API}/EURUSD/ohlc",
         {"interval": interval, "limit": 200}
     )
+
     bars = data.get("bars", [])
     if not bars:
-        raise ValueError(f"No hay velas disponibles para {interval}.")
+        raise ValueError(f"No hay velas para {interval}.")
 
     df = pd.DataFrame(bars)
     required = ["openTime", "open", "high", "low", "close"]
+
     for col in required:
         if col not in df.columns:
-            raise ValueError(f"Falta el campo {col} en las velas.")
+            raise ValueError(f"Falta el campo {col}.")
 
-    df["openTime"] = pd.to_datetime(df["openTime"], utc=True)
+    df["openTime"] = pd.to_datetime(
+        df["openTime"], utc=True, errors="coerce"
+    )
+
     for col in ["open", "high", "low", "close"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
     if "isOpen" not in df.columns:
         df["isOpen"] = False
+    else:
+        df["isOpen"] = (
+            df["isOpen"].astype(str).str.lower()
+            .isin(["true", "1", "yes"])
+        )
 
     return (
         df.dropna(subset=required)
@@ -86,77 +93,197 @@ def candle_data(interval):
     )
 
 
-def indicators(df):
+def add_indicators(df):
     df = df.copy()
-    df["ema9"] = df["close"].ewm(span=9, adjust=False).mean()
-    df["ema21"] = df["close"].ewm(span=21, adjust=False).mean()
+    close = df["close"]
+    high = df["high"]
+    low = df["low"]
 
-    change = df["close"].diff()
-    gain = change.clip(lower=0).ewm(
+    # EMA 9 y EMA 21
+    df["ema9"] = close.ewm(span=9, adjust=False).mean()
+    df["ema21"] = close.ewm(span=21, adjust=False).mean()
+
+    # RSI 14
+    change = close.diff()
+    gain = change.clip(lower=0)
+    loss = -change.clip(upper=0)
+
+    avg_gain = gain.ewm(
         alpha=1/14, min_periods=14, adjust=False
     ).mean()
-    loss = (-change.clip(upper=0)).ewm(
+
+    avg_loss = loss.ewm(
         alpha=1/14, min_periods=14, adjust=False
     ).mean()
 
-    rs = gain / loss.replace(0, float("nan"))
-    df["rsi"] = (100 - 100 / (1 + rs)).fillna(50)
+    rs = avg_gain / avg_loss.replace(0, float("nan"))
+    df["rsi"] = 100 - (100 / (1 + rs))
+    df.loc[(avg_loss == 0) & (avg_gain > 0), "rsi"] = 100
+    df.loc[(avg_gain == 0) & (avg_loss > 0), "rsi"] = 0
+
+    # MACD 12, 26, 9
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    df["macd"] = ema12 - ema26
+    df["macd_signal"] = df["macd"].ewm(
+        span=9, adjust=False
+    ).mean()
+    df["macd_hist"] = df["macd"] - df["macd_signal"]
+
+    # Bollinger Bands 20, 2
+    middle = close.rolling(20).mean()
+    std = close.rolling(20).std()
+    df["bb_mid"] = middle
+    df["bb_upper"] = middle + 2 * std
+    df["bb_lower"] = middle - 2 * std
+
+    # ADX 14 y líneas direccionales
+    up_move = high.diff()
+    down_move = -low.diff()
+
+    plus_dm = up_move.where(
+        (up_move > down_move) & (up_move > 0), 0.0
+    )
+    minus_dm = down_move.where(
+        (down_move > up_move) & (down_move > 0), 0.0
+    )
+
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs()
+    ], axis=1).max(axis=1)
+
+    atr = tr.ewm(
+        alpha=1/14, min_periods=14, adjust=False
+    ).mean()
+
+    plus_smoothed = plus_dm.ewm(
+        alpha=1/14, min_periods=14, adjust=False
+    ).mean()
+
+    minus_smoothed = minus_dm.ewm(
+        alpha=1/14, min_periods=14, adjust=False
+    ).mean()
+
+    df["plus_di"] = 100 * plus_smoothed / atr.replace(
+        0, float("nan")
+    )
+    df["minus_di"] = 100 * minus_smoothed / atr.replace(
+        0, float("nan")
+    )
+
+    di_sum = (df["plus_di"] + df["minus_di"]).replace(
+        0, float("nan")
+    )
+
+    dx = 100 * (
+        df["plus_di"] - df["minus_di"]
+    ).abs() / di_sum
+
+    df["adx"] = dx.ewm(
+        alpha=1/14, min_periods=14, adjust=False
+    ).mean()
+
     return df
 
 
-def analyze(one_min, fifteen_min, minute):
-    m = indicators(one_min[~one_min["isOpen"]].copy())
-    q = indicators(fifteen_min[~fifteen_min["isOpen"]].copy())
+def analyze(one_min, fifteen_min):
+    m = add_indicators(
+        one_min[~one_min["isOpen"]].copy()
+    ).reset_index(drop=True)
 
-    if len(m) < 30 or len(q) < 3:
-        return "NO OPERAR", 0, "Esperando suficientes velas cerradas."
+    q = add_indicators(
+        fifteen_min[~fifteen_min["isOpen"]].copy()
+    ).reset_index(drop=True)
 
-    last = m.iloc[-1]
-    prev = m.iloc[-2]
-    last15 = q.iloc[-1]
+    if len(m) < 60 or len(q) < 60:
+        return (
+            "WAIT", 0, 0,
+            "Faltan velas cerradas para calcular los indicadores."
+        )
+
+    x = m.iloc[-1]
+    trend = q.iloc[-1]
+
+    fields = [
+        "ema9", "ema21", "rsi", "macd",
+        "macd_signal", "macd_hist", "bb_mid",
+        "bb_upper", "bb_lower", "adx",
+        "plus_di", "minus_di"
+    ]
+
+    if any(pd.isna(x[f]) for f in fields):
+        return "WAIT", 0, 0, "Esperando indicadores válidos."
+
+    if any(pd.isna(trend[f]) for f in ["ema9", "ema21"]):
+        return "WAIT", 0, 0, "Esperando tendencia de 15 minutos."
 
     up = 0
     down = 0
     reasons = []
 
-    if last["ema9"] > last["ema21"]:
-        up += 30
-        reasons.append("Tendencia corta alcista")
-    elif last["ema9"] < last["ema21"]:
-        down += 30
-        reasons.append("Tendencia corta bajista")
-
-    if last["close"] > prev["close"]:
-        up += 15
-    elif last["close"] < prev["close"]:
-        down += 15
-
-    if 52 <= last["rsi"] <= 68:
+    # EMA: 20 puntos
+    if x["ema9"] > x["ema21"]:
         up += 20
-    elif 32 <= last["rsi"] <= 48:
+        reasons.append("EMA 1m alcista")
+    elif x["ema9"] < x["ema21"]:
         down += 20
+        reasons.append("EMA 1m bajista")
 
-    if last15["ema9"] > last15["ema21"]:
-        up += 25
-    elif last15["ema9"] < last15["ema21"]:
-        down += 25
+    # RSI: 15 puntos
+    if 52 <= x["rsi"] <= 68:
+        up += 15
+        reasons.append("RSI alcista")
+    elif 32 <= x["rsi"] <= 48:
+        down += 15
+        reasons.append("RSI bajista")
 
-    if last["rsi"] > 75:
-        up = max(0, up - 20)
-    if last["rsi"] < 25:
-        down = max(0, down - 20)
+    # MACD: 20 puntos
+    if x["macd"] > x["macd_signal"] and x["macd_hist"] > 0:
+        up += 20
+        reasons.append("MACD alcista")
+    elif x["macd"] < x["macd_signal"] and x["macd_hist"] < 0:
+        down += 20
+        reasons.append("MACD bajista")
 
-    if minute < 9:
-        return "ESPERANDO MINUTO 9", max(up, down), \
-            "El sistema espera la ventana de análisis."
+    # Bollinger: 10 puntos
+    if x["close"] > x["bb_mid"] and x["close"] < x["bb_upper"]:
+        up += 10
+        reasons.append("Precio sobre banda media")
+    elif x["close"] < x["bb_mid"] and x["close"] > x["bb_lower"]:
+        down += 10
+        reasons.append("Precio bajo banda media")
 
-    if up >= 70 and up - down >= 20:
-        return "SUBE", up, "Los indicadores favorecen el impulso alcista."
-    if down >= 70 and down - up >= 20:
-        return "BAJA", down, "Los indicadores favorecen el impulso bajista."
+    # ADX y DI: 15 puntos
+    if x["adx"] >= 20:
+        if x["plus_di"] > x["minus_di"]:
+            up += 15
+            reasons.append("ADX/DI alcista")
+        elif x["minus_di"] > x["plus_di"]:
+            down += 15
+            reasons.append("ADX/DI bajista")
 
-    return "NO OPERAR", max(up, down), \
-        "No hay suficiente confirmación entre los indicadores."
+    # Confirmación en velas de 15 minutos: 20 puntos
+    if trend["ema9"] > trend["ema21"]:
+        up += 20
+        reasons.append("Tendencia 15m alcista")
+    elif trend["ema9"] < trend["ema21"]:
+        down += 20
+        reasons.append("Tendencia 15m bajista")
+
+    if up >= 60 and up - down >= 20:
+        return "BUY UP", up, down, "; ".join(reasons)
+
+    if down >= 60 and down - up >= 20:
+        return "BUY DOWN", up, down, "; ".join(reasons)
+
+    return (
+        "WAIT", up, down,
+        "Indicadores sin suficiente confirmación. "
+        + "; ".join(reasons)
+    )
 
 
 def show_dashboard():
@@ -169,7 +296,6 @@ def show_dashboard():
         seconds_used = (now.minute % 15) * 60 + now.second
         remaining = 900 - seconds_used
         timer = f"{remaining // 60:02d}:{remaining % 60:02d}"
-        minute = seconds_used // 60
 
         price = float(quote["mid"])
         age = int(quote.get("quoteAgeSeconds", 9999))
@@ -177,52 +303,59 @@ def show_dashboard():
 
         st.markdown(
             '<div class="muted">LIVE MARKET INTELLIGENCE</div>'
-            '<h1>EUR/USD Signal Desk</h1>'
-            '<div class="muted">Analizador técnico • Solo señales</div>',
+            '<h1>EUR/USD SIGNAL DESK</h1>'
+            '<p>Indicadores técnicos • Horizonte de 15 minutos</p>',
             unsafe_allow_html=True
         )
 
         st.markdown(f"""
         <div class="hero">
-            <div class="muted">CUENTA REGRESIVA • INTERVALO 15 MIN</div>
+            <div class="muted">CUENTA REGRESIVA • 15 MINUTOS</div>
             <div class="timer">{timer}</div>
-            <div class="muted">Hora de referencia: UTC</div>
+            <div class="muted">Referencia UTC</div>
             <hr>
             <div class="muted">PRECIO MEDIO EUR/USD</div>
             <div class="price">{price:.5f}</div>
-            <div class="muted">
-                BID: {float(quote.get('bid', price)):.5f}
-                &nbsp; | &nbsp;
-                ASK: {float(quote.get('ask', price)):.5f}
-            </div>
+            <p>BID: {float(quote.get('bid', price)):.5f}
+            &nbsp; | &nbsp;
+            ASK: {float(quote.get('ask', price)):.5f}</p>
         </div>
         """, unsafe_allow_html=True)
 
         a, b, c = st.columns(3)
-        a.metric("Dirección de la fuente", str(quote.get("direction", "N/D")))
+        a.metric("Dirección de fuente", str(quote.get("direction", "N/D")))
         b.metric("Antigüedad del precio", f"{age} segundos")
-        c.metric("Minuto del intervalo", f"{minute} / 15")
+        c.metric("Velas de 1m", len(one[~one["isOpen"]]))
 
         if stale or age > 60:
-            st.warning("Precio atrasado. No confíes en las señales actuales.")
+            st.warning("Cotización atrasada: señales desactivadas.")
 
-        signal, score, reason = analyze(one, fifteen, minute)
+        signal, up, down, reason = analyze(one, fifteen)
 
         if stale or age > 60:
-            signal = "NO OPERAR"
-            reason = "Datos atrasados: señal desactivada."
+            signal = "WAIT"
+            reason = "Los datos de cotización están atrasados."
+
+        if signal == "BUY UP":
+            st.success("🟢 BUY UP — sesgo alcista")
+        elif signal == "BUY DOWN":
+            st.error("🔴 BUY DOWN — sesgo bajista")
+        else:
+            st.warning("🟡 WAIT — sin confirmación suficiente")
+
+        left, right = st.columns(2)
+        left.metric("Puntuación alcista", f"{up}/100")
+        right.metric("Puntuación bajista", f"{down}/100")
 
         st.markdown(
-            f'<div class="signal"><div class="muted">SEÑAL TÉCNICA</div>'
-            f'<h2>{signal}</h2>'
-            f'<p>Puntuación técnica: {score}/100</p>'
+            f'<div class="signal"><b>Análisis de indicadores</b>'
             f'<p>{reason}</p></div>',
             unsafe_allow_html=True
         )
 
         st.caption(
-            "La puntuación no es una probabilidad de ganar. "
-            "No garantiza un 80% de acierto ni ejecuta operaciones."
+            "Las puntuaciones son reglas técnicas, no probabilidades "
+            "de ganar. Las señales no garantizan resultados."
         )
 
         chart = go.Figure(data=[go.Candlestick(
@@ -245,10 +378,33 @@ def show_dashboard():
             margin=dict(l=10, r=10, t=25, b=10)
         )
 
-        st.subheader("Gráfico de velas de 1 minuto")
+        st.subheader("Gráfico EUR/USD de 1 minuto")
         st.plotly_chart(chart, use_container_width=True)
 
-        with st.expander("Ver velas de 15 minutos"):
+        tech = add_indicators(
+            one[~one["isOpen"]].copy()
+        )
+
+        if not tech.empty:
+            last = tech.iloc[-1]
+            with st.expander("Ver indicadores técnicos"):
+                st.dataframe(pd.DataFrame({
+                    "Indicador": [
+                        "EMA 9", "EMA 21", "RSI (14)",
+                        "MACD", "MACD Signal", "MACD Histogram",
+                        "Bollinger superior", "Bollinger media",
+                        "Bollinger inferior", "ADX (14)", "+DI", "-DI"
+                    ],
+                    "Valor": [
+                        last["ema9"], last["ema21"], last["rsi"],
+                        last["macd"], last["macd_signal"],
+                        last["macd_hist"], last["bb_upper"],
+                        last["bb_mid"], last["bb_lower"],
+                        last["adx"], last["plus_di"], last["minus_di"]
+                    ]
+                }).round(5), use_container_width=True, hide_index=True)
+
+        with st.expander("Ver últimas velas de 15 minutos"):
             st.dataframe(
                 fifteen.tail(20),
                 use_container_width=True,
@@ -263,10 +419,10 @@ def show_dashboard():
         st.error("No se pudo conectar con BiQuote.")
         st.code(str(exc))
     except (ValueError, KeyError, TypeError, IndexError) as exc:
-        st.error("Los datos recibidos no tienen el formato esperado.")
+        st.error("No se pudieron procesar los datos.")
         st.code(str(exc))
     except Exception as exc:
-        st.error("Se produjo un error inesperado.")
+        st.error("Error inesperado.")
         st.code(str(exc))
 
 
