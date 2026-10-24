@@ -1,34 +1,34 @@
 # -*- coding: utf-8 -*-
 """
-Analizador de señales — Kalshi BTC 15 minutos (serie KXBTC15M)  ·  versión móvil + diagnóstico
-===============================================================================================
-* Es un ANALIZADOR. No compra ni vende nada. No necesita claves de API.
-* Datos de precio: Coinbase Exchange (API pública).
-* Datos del contrato: Kalshi (API pública de mercado, sin autenticación).
+Kalshi Signal Bot — SOLO BTC/USD · contratos KXBTC15M (15 minutos)
+===================================================================
+* ANÁLISIS: solo con endpoints públicos, sin claves.
+* OPERACIÓN (opcional, APAGADA por defecto): puede enviar órdenes a Kalshi con TUS claves (variables de entorno).
+  Modos: Apagado · Simulación (no envía nada) · REAL (requiere KALSHI_LIVE_OK=1 y confirmación escrita).
+* Precio/velas: Coinbase (Exchange API; respaldo: API pública de Advanced Trade). Contrato: Kalshi (público).
 * Los resultados pasados NO garantizan resultados futuros. Esto no es asesoría financiera.
 
-Novedades de esta versión
--------------------------
-* Panel de diagnóstico: estado de CADA filtro (valor leído, límite, motivo), probabilidades leídas,
-  indicadores, horas de actualización y valores crudos de Kalshi.
-* Se evalúan todos los filtros a la vez (antes el primero que fallaba ocultaba a los demás).
-* Interfaz pensada para celular (una columna, tarjetas, tablas compactas, gráfica estática).
-* Correcciones: ver la lista "CAMBIOS" en la ayuda de la propia app.
-
-Ejecutar:   streamlit run app.py
+Instalar:        pip install "streamlit>=1.37" pandas numpy requests plotly cryptography
+Ejecutar:        streamlit run app.py
+Auto-pruebas:    python app.py --selftest        (datos SINTÉTICOS, no necesita internet)
+Diagnóstico red: python app.py --live-check      (consulta Coinbase y Kalshi UNA vez e imprime el retraso real)
 """
 from __future__ import annotations
 
+import base64
 import html as _html
 import json
 import math
 import os
 import re
+import sys
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -36,7 +36,6 @@ import pandas as pd
 import requests
 import streamlit as st
 from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -45,6 +44,7 @@ from plotly.subplots import make_subplots
 # CONSTANTES
 # ──────────────────────────────────────────────────────────────────────────────
 COINBASE_BASE = "https://api.exchange.coinbase.com"
+COINBASE_ADV_BASE = "https://api.coinbase.com"          # respaldo: endpoints públicos de mercado (sin clave)
 KALSHI_BASE = os.getenv("KALSHI_API_BASE", "https://api.elections.kalshi.com/trade-api/v2")
 PRODUCT = "BTC-USD"
 SERIES = os.getenv("KALSHI_SERIES", "KXBTC15M")
@@ -57,9 +57,13 @@ LOCAL_TZ = ZoneInfo(DEFAULT_TZ)
 TZ_CHOICES = ["America/Chicago", "America/New_York", "America/Denver", "America/Los_Angeles",
               "America/Mexico_City", "America/Bogota", "America/Lima", "America/Santiago",
               "America/Argentina/Buenos_Aires", "America/Caracas", "Europe/Madrid", "UTC"]
-UA = {"User-Agent": "kalshi-btc15-analyzer/1.1", "Accept": "application/json"}
+# "no-cache" pide a intermediarios (CDN) no servir copias viejas; no todos lo respetan, por eso se mide la edad real.
+UA = {"User-Agent": "kalshi-btc15-analyzer/2.0", "Accept": "application/json",
+      "Cache-Control": "no-cache", "Pragma": "no-cache"}
 PRICE_KEYS = ("yes_bid", "yes_ask", "no_bid", "no_ask")
-CANDLE_MAX_LAG_S = 150        # retraso máximo aceptado de la última vela cerrada
+CANDLE_SPAN_MIN = 290         # minutos pedidos a Coinbase (límite de la API: 300 velas por solicitud)
+HTTP_TIMEOUT = (3.5, 7.0)     # (conexión, lectura) en segundos
+HTTP_RETRIES = 2              # reintentos controlados (con espera creciente)
 
 GROUPS = [  # (etiqueta, columna, peso)  — 5 grupos, no 12 indicadores sueltos
     ("Tendencia (EMA 9/21/50 y pendiente de EMA 21)", "g_trend", 0.25),
@@ -69,76 +73,109 @@ GROUPS = [  # (etiqueta, columna, peso)  — 5 grupos, no 12 indicadores sueltos
     ("Estructura (rupturas, soportes/resistencias)", "g_struct", 0.20),
 ]
 
-# Filtros de la fase de decisión (se usan también para rellenar "no evaluado" cuando faltan datos)
 DECISION_FILTERS = [
     ("quotes", "Precios de compra de Kalshi"),
     ("time_left", "Tiempo restante"),
     ("edge", "Ventaja neta mínima"),
     ("entry", "Rango del precio de entrada"),
     ("spread", "Spread máximo"),
+    ("depth", "Liquidez (contratos disponibles)"),
     ("uncertainty", "Incertidumbre"),
 ]
 
 
 @dataclass
 class Cfg:
-    refresh_s: int = 8
+    refresh_s: int = 6
     min_edge: float = 0.04        # ventaja mínima neta (en $ por contrato)
     uncal_extra: float = 0.02     # margen extra mientras el modelo no esté validado
     max_spread: float = 0.08
     min_entry: float = 0.05
     max_entry: float = 0.95
+    min_depth: float = 5.0        # contratos mínimos disponibles al precio de entrada (si Kalshi informa el tamaño)
     fee_rate: float = 0.07        # comisión taker general de Kalshi: rate*P*(1-P)
     slippage: float = 0.01
     min_tau_min: float = 0.75     # no emitir señal con menos de 45 s
     basis_bps: float = 1.5        # incertidumbre Coinbase vs BRTI (puntos base)
     drift_cap: float = 0.25       # máximo desplazamiento (en desv. típicas) que puede aportar el score
     sigma_inflate: float = 1.10   # colas gruesas
-    max_age_s: int = 20           # antigüedad máxima aceptada de precio/Kalshi (tiempo desde la descarga)
-    max_trade_age_s: int = 60     # NUEVO: antigüedad máxima de la última operación de Coinbase
-    max_clock_skew_s: float = 8.0  # desfase máximo del reloj local frente a los servidores
-    max_ref_dev: float = 0.03     # NUEVO: |ln(precio/referencia)| máximo creíble en 15 min (3 %)
-    quote_tol: float = 0.02       # NUEVO: tolerancia de coherencia entre precios YES y NO ($)
+    max_age_s: int = 20           # antigüedad máxima del precio / datos de Kalshi (desde la descarga)
+    max_trade_age_s: int = 60     # antigüedad máxima de la última operación de Coinbase
+    candle_warn_s: int = 75       # vela cerrada: amarillo si su antigüedad supera esto
+    candle_max_s: int = 150       # vela cerrada: ROJO y bloqueo si su antigüedad supera esto
+    stale_trigger_s: int = 90     # si la fuente principal supera esto, se consulta también la de respaldo
+    max_clock_skew_s: float = 8.0
+    max_ref_dev: float = 0.03
+    quote_tol: float = 0.02
     chart_minutes: int = 60
     use_backtest: bool = True
     sim_half_spread: float = 0.01
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# HTTP
+# HTTP (sin dependencias de Streamlit: se puede usar desde --live-check)
 # ──────────────────────────────────────────────────────────────────────────────
-@st.cache_resource
+_SESSION: Optional[requests.Session] = None
+_BACKOFF: Dict[str, float] = {}   # base_url -> instante (epoch) hasta el que NO se consulta tras un HTTP 429
+
+
 def get_session() -> requests.Session:
-    s = requests.Session()
-    retry = Retry(total=2, backoff_factor=0.4, status_forcelist=(500, 502, 503, 504),
-                  allowed_methods=("GET",), raise_on_status=False)
-    s.mount("https://", HTTPAdapter(max_retries=retry))
-    return s
+    global _SESSION
+    if _SESSION is None:
+        s = requests.Session()
+        s.mount("https://", HTTPAdapter(pool_connections=4, pool_maxsize=8))
+        _SESSION = s
+    return _SESSION
 
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def http_get(base: str, path: str, params: Optional[dict] = None, timeout: int = 8
-             ) -> Tuple[Any, float, Optional[datetime]]:
-    t0 = time.time()
-    r = get_session().get(base + path, params=params, headers=UA, timeout=timeout)
-    lat = (time.time() - t0) * 1000
-    if r.status_code == 429:
-        raise RuntimeError("Límite de solicitudes alcanzado (HTTP 429). Aumenta el intervalo de actualización.")
-    if r.status_code >= 400:
-        raise RuntimeError(f"HTTP {r.status_code}: {r.text[:120]}")
-    try:
-        j = r.json()
-    except ValueError:
-        raise RuntimeError("Respuesta inválida (no es JSON).")
-    server_dt = None
-    try:
-        server_dt = parsedate_to_datetime(r.headers["Date"])
-    except Exception:
-        pass
-    return j, lat, server_dt
+def http_get(base: str, path: str, params: Optional[dict] = None, timeout: Tuple[float, float] = HTTP_TIMEOUT,
+             retries: int = HTTP_RETRIES) -> Tuple[Any, float, Optional[datetime], dict]:
+    """GET con reintentos controlados (solo errores de red y 5xx), respeto de HTTP 429 y metadatos de caché.
+
+    Devuelve (json, latencia_ms, cabecera Date del servidor, meta). meta incluye 'age' (cabecera Age, segundos
+    que la respuesta estuvo en caché de un intermediario) y 'cache' (estado de caché si el servidor lo informa)."""
+    wait = _BACKOFF.get(base, 0.0) - time.time()
+    if wait > 0:
+        raise RuntimeError(f"En espera por límite de solicitudes (HTTP 429): {wait:.0f} s más antes de reintentar.")
+    last_err = "sin detalle"
+    for attempt in range(retries + 1):
+        t0 = time.time()
+        try:
+            r = get_session().get(base + path, params=params, headers=UA, timeout=timeout)
+        except (requests.Timeout, requests.ConnectionError) as e:
+            last_err = f"{type(e).__name__}"
+        else:
+            lat = (time.time() - t0) * 1000
+            if r.status_code == 429:
+                ra = _to_float(r.headers.get("Retry-After"))
+                _BACKOFF[base] = time.time() + min(max(ra if ra is not None else 15.0, 5.0), 120.0)
+                raise RuntimeError("Límite de solicitudes alcanzado (HTTP 429). Se pausan las consultas a ese servidor "
+                                   "unos segundos; aumenta el intervalo de actualización si se repite.")
+            if r.status_code >= 500:
+                last_err = f"HTTP {r.status_code}"
+            elif r.status_code >= 400:
+                raise RuntimeError(f"HTTP {r.status_code}: {r.text[:120]}")
+            else:
+                try:
+                    j = r.json()
+                except ValueError:
+                    raise RuntimeError("Respuesta incompleta o inválida (no es JSON).")
+                server_dt = None
+                try:
+                    server_dt = parsedate_to_datetime(r.headers["Date"])
+                except Exception:
+                    pass
+                meta = {"date": server_dt, "age": _to_float(r.headers.get("Age")),
+                        "cache": r.headers.get("CF-Cache-Status") or r.headers.get("X-Cache"),
+                        "attempts": attempt + 1}
+                return j, lat, server_dt, meta
+        if attempt < retries:
+            time.sleep(0.3 * (2 ** attempt))
+    raise RuntimeError(f"Sin respuesta válida tras {retries + 1} intentos ({last_err}).")
 
 
 def _to_float(x: Any) -> Optional[float]:
@@ -149,13 +186,17 @@ def _to_float(x: Any) -> Optional[float]:
         return None
 
 
+def _iso(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 # ──────────────────────────────────────────────────────────────────────────────
-# COINBASE
+# COINBASE: precio
 # ──────────────────────────────────────────────────────────────────────────────
-@st.cache_data(ttl=3, show_spinner=False)
 def fetch_ticker() -> dict:
-    j, lat, sdt = http_get(COINBASE_BASE, f"/products/{PRODUCT}/ticker")
-    price = _to_float(j.get("price"))
+    j, lat, sdt, meta = http_get(COINBASE_BASE, f"/products/{PRODUCT}/ticker")
+    t_recv = utcnow()
+    price = _to_float(j.get("price")) if isinstance(j, dict) else None
     if price is None or price <= 0:
         raise RuntimeError("Coinbase devolvió un precio inválido.")
     ex_time = None
@@ -164,11 +205,18 @@ def fetch_ticker() -> dict:
     except Exception:
         pass
     return {"price": price, "bid": _to_float(j.get("bid")), "ask": _to_float(j.get("ask")),
-            "exchange_time": ex_time, "fetched_at": utcnow(), "latency_ms": lat, "server_date": sdt}
+            "exchange_time": ex_time, "fetched_at": t_recv, "latency_ms": lat, "server_date": sdt, "meta": meta}
 
 
-def parse_candles(raw: Any) -> pd.DataFrame:
-    """Coinbase: [[time, low, high, open, close, volume], ...] (más reciente primero)."""
+# ──────────────────────────────────────────────────────────────────────────────
+# COINBASE: velas (validación estricta de timestamps y de velas cerradas)
+# ──────────────────────────────────────────────────────────────────────────────
+def parse_candles(raw: Any, now: Optional[datetime] = None, max_future_s: float = 5.0) -> Tuple[pd.DataFrame, dict]:
+    """[[time, low, high, open, close, volume], ...] con time = inicio de la vela en epoch UTC (segundos).
+
+    Valida y CUENTA (no oculta): filas inválidas, desalineadas a minuto, futuras, duplicadas y desordenadas.
+    No inventa ninguna vela."""
+    now = now or utcnow()
     if not isinstance(raw, list) or len(raw) == 0:
         raise RuntimeError("Coinbase devolvió velas vacías o en formato inesperado.")
     try:
@@ -177,21 +225,61 @@ def parse_candles(raw: Any) -> pd.DataFrame:
         raise RuntimeError("Velas con valores no numéricos.")
     if arr.ndim != 2 or arr.shape[1] < 6:
         raise RuntimeError("Las velas no tienen las 6 columnas esperadas.")
+    d_ts = np.diff(arr[:, 0])
+    rep = {"filas": int(len(arr)), "invalidas": 0, "desalineadas": 0, "futuras": 0, "duplicadas": 0,
+           "desordenadas": bool(len(d_ts) and not (np.all(d_ts <= 0) or np.all(d_ts >= 0)))}
     df = pd.DataFrame(arr[:, :6], columns=["ts", "low", "high", "open", "close", "volume"])
+    n0 = len(df)
     df = df[np.isfinite(df).all(axis=1)]
     df = df[(df[["low", "high", "open", "close"]] > 0).all(axis=1)]
     df = df[(df["high"] >= df[["open", "close", "low"]].max(axis=1) - 1e-9)
             & (df["low"] <= df[["open", "close", "high"]].min(axis=1) + 1e-9)
             & (df["volume"] >= 0)]
+    rep["invalidas"] = n0 - len(df)
+    aligned = (df["ts"] % 60) == 0
+    rep["desalineadas"] = int((~aligned).sum())
+    df = df[aligned]
+    fut = df["ts"] > now.timestamp() + max_future_s
+    rep["futuras"] = int(fut.sum())
+    df = df[~fut]
+    dup = df.duplicated("ts", keep="last")
+    rep["duplicadas"] = int(dup.sum())
+    df = df[~dup]
     if df.empty:
         raise RuntimeError("Todas las velas recibidas fueron inválidas.")
+    df = df.copy()
     df["time"] = pd.to_datetime(df["ts"].astype("int64"), unit="s", utc=True)
-    df = df.drop(columns="ts").drop_duplicates("time").sort_values("time").reset_index(drop=True)
-    return df[["time", "open", "high", "low", "close", "volume"]]
+    df = df.drop(columns="ts").sort_values("time").reset_index(drop=True)
+    return df[["time", "open", "high", "low", "close", "volume"]], rep
+
+
+def split_closed(df: pd.DataFrame, now: datetime) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Separa velas CERRADAS (inicio + 60 s ≤ ahora) de la que aún se forma. La hora de cierre de la vela
+    NO es la hora de cierre del contrato."""
+    ended = df["time"] + pd.Timedelta(seconds=60) <= pd.Timestamp(now)
+    return df[ended].reset_index(drop=True), df[~ended].reset_index(drop=True)
+
+
+def candle_age_s(closed: Optional[pd.DataFrame], now: datetime) -> float:
+    """Segundos transcurridos desde el CIERRE de la última vela cerrada (inf si no hay)."""
+    if closed is None or len(closed) == 0:
+        return float("inf")
+    end = closed["time"].iloc[-1].to_pydatetime() + timedelta(seconds=60)
+    return (now - end).total_seconds()
+
+
+def gap_stats(closed_raw: pd.DataFrame) -> Tuple[int, int]:
+    """(minutos faltantes en todo el tramo, minutos faltantes en los últimos 10 intervalos). Coinbase omite
+    minutos sin operaciones; aquí solo se cuentan, no se rellenan."""
+    if len(closed_raw) < 2:
+        return 0, 0
+    steps = (closed_raw["time"].diff().dt.total_seconds().iloc[1:] / 60 - 1).clip(lower=0).round().astype(int)
+    return int(steps.sum()), int(steps.tail(10).sum())
 
 
 def fill_gaps(df: pd.DataFrame) -> Tuple[pd.DataFrame, int]:
-    """Rellena minutos sin operaciones (Coinbase los omite): vela plana, volumen 0."""
+    """Rellena SOLO huecos INTERNOS (minutos sin operaciones: vela plana, volumen 0). Nunca extiende la serie
+    hacia el presente: un retraso al final se ve como retraso."""
     d = df.set_index("time")
     full = pd.date_range(d.index[0], d.index[-1], freq="60s")
     missing = len(full) - len(d)
@@ -206,63 +294,126 @@ def fill_gaps(df: pd.DataFrame) -> Tuple[pd.DataFrame, int]:
     return d.reset_index(), missing
 
 
-@st.cache_data(ttl=5, show_spinner=False)
-def fetch_candles() -> dict:
-    j, lat, sdt = http_get(COINBASE_BASE, f"/products/{PRODUCT}/candles", params={"granularity": 60})
-    df = parse_candles(j)
-    return {"df": df, "fetched_at": utcnow(), "latency_ms": lat, "server_date": sdt}
+def _exchange_raw(now: datetime) -> Tuple[Any, float, Optional[datetime], dict]:
+    # start/end EXPLÍCITOS: la consulta sin parámetros devuelve una respuesta compartida que puede venir de caché
+    # y quedar atrás; con 'end' = ahora la URL cambia en cada solicitud y no se reutiliza una copia vieja.
+    end = now.replace(microsecond=0)
+    start = end - timedelta(minutes=CANDLE_SPAN_MIN)
+    return http_get(COINBASE_BASE, f"/products/{PRODUCT}/candles",
+                    params={"granularity": 60, "start": _iso(start), "end": _iso(end)})
 
 
-@st.cache_data(ttl=900, show_spinner=False)
+def _advanced_to_raw(j: Any) -> List[List[float]]:
+    c = j.get("candles") if isinstance(j, dict) else None
+    if not isinstance(c, list) or not c:
+        raise RuntimeError("Advanced Trade devolvió velas vacías o en formato inesperado.")
+    out = []
+    for x in c:
+        try:
+            out.append([float(x["start"]), float(x["low"]), float(x["high"]), float(x["open"]),
+                        float(x["close"]), float(x["volume"])])
+        except (KeyError, TypeError, ValueError):
+            continue
+    if not out:
+        raise RuntimeError("Advanced Trade: ninguna vela con formato válido.")
+    return out
+
+
+def _advanced_raw(now: datetime) -> Tuple[Any, float, Optional[datetime], dict]:
+    end = int(now.timestamp())
+    start = end - CANDLE_SPAN_MIN * 60
+    j, lat, sdt, meta = http_get(COINBASE_ADV_BASE, f"/api/v3/brokerage/market/products/{PRODUCT}/candles",
+                                 params={"start": str(start), "end": str(end), "granularity": "ONE_MINUTE"})
+    return _advanced_to_raw(j), lat, sdt, meta
+
+
+CANDLE_SOURCES: List[Tuple[str, Callable[[datetime], Tuple[Any, float, Optional[datetime], dict]]]] = [
+    ("Coinbase Exchange", _exchange_raw),
+    ("Coinbase Advanced (respaldo)", _advanced_raw),
+]
+
+
+def fetch_candles(stale_trigger_s: float = 90.0) -> dict:
+    """Descarga velas de 1 min. Consulta la fuente principal; si su última vela cerrada está atrasada (o falla),
+    consulta también la de respaldo y usa la MÁS RECIENTE. Nunca mezcla fuentes ni fabrica velas.
+    Cada intento queda registrado en 'attempts' para el diagnóstico."""
+    attempts: List[dict] = []
+    best: Optional[dict] = None
+    for name, fn in CANDLE_SOURCES:
+        t_req = utcnow()
+        try:
+            j, lat, sdt, meta = fn(t_req)
+            t_recv = utcnow()
+            df, rep = parse_candles(j, t_recv)
+            closed, _ = split_closed(df, t_recv)
+            age = candle_age_s(closed, t_recv)
+            resp_age = None if sdt is None else (t_recv - sdt).total_seconds()
+            attempts.append({"source": name, "ok": True, "candle_age_s": age, "latency_ms": lat,
+                             "resp_age_s": resp_age, "age_header": meta.get("age"), "cache": meta.get("cache"),
+                             "report": rep, "error": None})
+            cand = {"df": df, "fetched_at": t_recv, "latency_ms": lat, "server_date": sdt, "source": name,
+                    "report": rep, "meta": meta}
+            if best is None or age < best["_age"]:
+                best = dict(cand, _age=age)
+            if age <= stale_trigger_s:
+                break           # suficientemente reciente: no hace falta consultar el respaldo
+        except Exception as e:  # noqa: BLE001
+            attempts.append({"source": name, "ok": False, "candle_age_s": None, "latency_ms": None,
+                             "resp_age_s": None, "age_header": None, "cache": None, "report": None,
+                             "error": f"{type(e).__name__}: {str(e)[:140]}"})
+    if best is None:
+        raise RuntimeError("Ninguna fuente de velas respondió: "
+                           + " | ".join(f"{a['source']}: {a['error']}" for a in attempts))
+    best.pop("_age", None)
+    best["attempts"] = attempts
+    return best
+
+
 def fetch_history(hours: int) -> pd.DataFrame:
-    """Historial de velas de 1 min paginando (máx. ~290 velas por solicitud)."""
-    end = utcnow().replace(second=0, microsecond=0)
+    """Historial de velas de 1 min paginando (máx. ~290 velas por solicitud). Solo velas cerradas."""
+    now = utcnow()
+    end = now.replace(second=0, microsecond=0)
     remaining = int(hours) * 60
     frames = []
-    fmt = "%Y-%m-%dT%H:%M:%SZ"
     while remaining > 0:
         n = min(290, remaining)
         start = end - timedelta(minutes=n)
-        j, _, _ = http_get(COINBASE_BASE, f"/products/{PRODUCT}/candles",
-                           params={"granularity": 60, "start": start.strftime(fmt), "end": end.strftime(fmt)},
-                           timeout=15)
+        j, _, _, _ = http_get(COINBASE_BASE, f"/products/{PRODUCT}/candles",
+                              params={"granularity": 60, "start": _iso(start), "end": _iso(end)}, timeout=(3.5, 15))
         if isinstance(j, list) and j:
-            frames.append(parse_candles(j))
+            frames.append(parse_candles(j, now)[0])
         end = start
         remaining -= n
         time.sleep(0.2)  # cortesía con el límite de la API pública
     if not frames:
         raise RuntimeError("No se pudo descargar historial de Coinbase.")
     df = pd.concat(frames).drop_duplicates("time").sort_values("time").reset_index(drop=True)
-    # descartar la vela que aún se está formando
-    df = df[df["time"] + pd.Timedelta(seconds=60) <= pd.Timestamp(utcnow())].reset_index(drop=True)
-    return df
+    return split_closed(df, utcnow())[0]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # KALSHI
 # ──────────────────────────────────────────────────────────────────────────────
-@st.cache_data(ttl=4, show_spinner=False)
 def fetch_kalshi_markets() -> dict:
-    j, lat, sdt = http_get(KALSHI_BASE, "/markets",
-                           params={"series_ticker": SERIES, "status": "open", "limit": 50})
+    j, lat, sdt, meta = http_get(KALSHI_BASE, "/markets",
+                                 params={"series_ticker": SERIES, "status": "open", "limit": 50})
+    t_recv = utcnow()
     markets = j.get("markets") if isinstance(j, dict) else None
     if not isinstance(markets, list):
         raise RuntimeError("Kalshi no devolvió la lista 'markets'.")
-    return {"markets": [parse_market(m) for m in markets], "fetched_at": utcnow(),
-            "latency_ms": lat, "server_date": sdt}
+    return {"markets": [parse_market(m) for m in markets], "fetched_at": t_recv,
+            "latency_ms": lat, "server_date": sdt, "meta": meta}
 
 
 def fetch_kalshi_market_result(ticker: str) -> Optional[str]:
-    j, _, _ = http_get(KALSHI_BASE, f"/markets/{ticker}")
+    j, _, _, _ = http_get(KALSHI_BASE, f"/markets/{ticker}")
     m = j.get("market", j) if isinstance(j, dict) else {}
     res = str(m.get("result") or "").lower()
     return res if res in ("yes", "no") else None
 
 
 def _kprice(m: dict, key: str) -> Optional[float]:
-    """Kalshi expone precios en dólares (*_dollars, texto). Desde marzo de 2026 los campos en centavos
-    enteros ya no existen; se mantiene el respaldo por si algún entorno los devuelve.
+    """Kalshi expone precios en dólares (*_dollars, texto). Se mantiene el respaldo en centavos.
     Un precio 0 o 1 significa "sin órdenes" y se descarta (se deriva del lado contrario)."""
     v = _to_float(m.get(f"{key}_dollars"))
     if v is None:
@@ -501,6 +652,33 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     return d
 
 
+def turn_alerts(f: pd.DataFrame) -> List[Tuple[str, int]]:
+    """Señales de posible CAMBIO de dirección (solo informativas y para sumar incertidumbre; nunca generan una
+    señal por sí solas). Devuelve [(texto, dirección_sugerida_para_BTC: +1 / -1 / 0)]."""
+    out: List[Tuple[str, int]] = []
+    if f is None or len(f) < 6:
+        return out
+    s = np.sign(f["ema9"] - f["ema21"]).tail(4).to_numpy()
+    if s[-1] != 0 and s[-1] != s[0]:
+        out.append(("EMA 9 cruzó la EMA 21 en las últimas 3 velas", int(s[-1])))
+    h = f["macd_hist"].tail(4).to_numpy()
+    if np.sign(h[-1]) != 0 and np.sign(h[-1]) != np.sign(h[0]):
+        out.append(("El histograma MACD cambió de signo en las últimas 3 velas", int(np.sign(h[-1]))))
+    ah = np.abs(f["macd_hist"].tail(4).to_numpy())
+    sh = np.sign(f["macd_hist"].iloc[-1])
+    if sh != 0 and np.all(np.diff(ah) < 0) and np.sign(f["macd_hist"].iloc[-4]) == sh:
+        out.append(("El histograma MACD se debilita 3 velas seguidas (momentum agotándose)", int(-sh)))
+    r0, r1 = float(f["rsi"].iloc[-2]), float(f["rsi"].iloc[-1])
+    if r0 > 70 >= r1:
+        out.append(("RSI sale de sobrecompra (posible giro a la baja)", -1))
+    if r0 < 30 <= r1:
+        out.append(("RSI sale de sobreventa (posible giro al alza)", 1))
+    sr = f["sigma_ratio"].iloc[-1]
+    if np.isfinite(sr) and sr > 1.6:
+        out.append((f"La volatilidad reciente se disparó (σ reciente/σ 60 min = {sr:.2f})", 0))
+    return out
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # MODELO
 # ──────────────────────────────────────────────────────────────────────────────
@@ -562,7 +740,7 @@ def fit_platt(p: np.ndarray, y: np.ndarray, lam: float = 1.0) -> Tuple[float, fl
 # FORMATO
 # ──────────────────────────────────────────────────────────────────────────────
 def cents(x: Optional[float]) -> str:
-    """Kalshi cotiza con décimas de centavo (p. ej. 91.7¢ por encima de 90¢): no redondear a ciegas."""
+    """Kalshi cotiza con décimas de centavo (p. ej. 91.7¢): no redondear a ciegas."""
     if x is None:
         return "—"
     c = x * 100
@@ -594,6 +772,39 @@ def mkf(fid: str, name: str, status: str, value: str = "", limit: str = "", deta
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# FRESCURA (semáforo verde / amarillo / rojo)
+# ──────────────────────────────────────────────────────────────────────────────
+def freshness(price_age: Optional[float], trade_age: Optional[float], candle_age: Optional[float],
+              kalshi_age: Optional[float], conn_errors: List[str], cfg: Cfg) -> Tuple[str, List[str]]:
+    """Devuelve ('green'|'yellow'|'red', motivos). Rojo = alguna fuente crítica está obsoleta o no responde."""
+    rank = {"green": 0, "yellow": 1, "red": 2}
+    level, why = "green", []
+
+    def bump(lv: str, msg: str) -> None:
+        nonlocal level
+        if rank[lv] > rank[level]:
+            level = lv
+        why.append(msg)
+
+    def chk(name: str, age: Optional[float], warn: float, bad: float) -> None:
+        if age is None or not np.isfinite(age):
+            bump("red", f"{name}: sin datos")
+        elif age > bad:
+            bump("red", f"{name}: {age:.0f} s (límite {bad:.0f} s)")
+        elif age > warn:
+            bump("yellow", f"{name}: {age:.0f} s (aviso desde {warn:.0f} s)")
+
+    chk("Precio", price_age, cfg.max_age_s / 2, cfg.max_age_s)
+    if trade_age is not None:
+        chk("Última operación", trade_age, cfg.max_trade_age_s / 2, cfg.max_trade_age_s)
+    chk("Vela cerrada", candle_age, cfg.candle_warn_s, cfg.candle_max_s)
+    chk("Kalshi", kalshi_age, cfg.max_age_s / 2, cfg.max_age_s)
+    for e in conn_errors:
+        bump("yellow", f"Último intento fallido: {e}")
+    return level, why
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # COSTES, INCERTIDUMBRE Y DECISIÓN
 # ──────────────────────────────────────────────────────────────────────────────
 def kalshi_fee(price: float, rate: float) -> float:
@@ -607,7 +818,7 @@ def kalshi_fee_order(contracts: int, price: float, rate: float) -> float:
 
 
 def uncertainty(z: float, sd: float, sigma_ratio: float, spread: Optional[float],
-                tau_min: float, calibrated: bool, cfg: Cfg) -> Tuple[str, List[str], int]:
+                tau_min: float, calibrated: bool, cfg: Cfg, turn_against: int = 0) -> Tuple[str, List[str], int]:
     """Cada factor suma 1 punto. 0-1 → Baja · 2-3 → Media · 4 o más → Alta (bloquea la señal)."""
     pts, why = 0, []
     if not calibrated:
@@ -622,6 +833,8 @@ def uncertainty(z: float, sd: float, sigma_ratio: float, spread: Optional[float]
         pts += 1; why.append("quedan menos de 2 min: el error de referencia pesa más (+1)")
     if sd > 0 and (cfg.basis_bps / 1e4) / sd > 0.6:
         pts += 1; why.append("el error Coinbase↔BRTI es comparable al movimiento esperado (+1)")
+    if turn_against >= 1:
+        pts += 1; why.append(f"{turn_against} señal(es) de posible cambio de dirección contraria(s) a la apuesta (+1)")
     label = "Baja" if pts <= 1 else "Media" if pts <= 3 else "Alta"
     return label, why, pts
 
@@ -633,15 +846,15 @@ def decide(p_yes: float, q: dict, tau_min: float, cfg: Cfg, calibrated: bool,
     req = cfg.min_edge + (0.0 if calibrated else cfg.uncal_extra)
     out: Dict[str, Any] = {"signal": "ESPERAR", "side": None, "best": None, "reasons": [], "sides": {},
                            "req_edge": req, "filters": []}
-    for side, p, ask, bid in (("UP", p_yes, q.get("yes_ask"), q.get("yes_bid")),
-                              ("DOWN", 1 - p_yes, q.get("no_ask"), q.get("no_bid"))):
+    for side, p, ask, bid, depth in (("UP", p_yes, q.get("yes_ask"), q.get("yes_bid"), q.get("yes_ask_size")),
+                                     ("DOWN", 1 - p_yes, q.get("no_ask"), q.get("no_bid"), q.get("yes_bid_size"))):
         if ask is None:
             out["sides"][side] = None
             continue
         fee = kalshi_fee(ask, cfg.fee_rate)
         be = ask + fee + cfg.slippage
         out["sides"][side] = {
-            "p": p, "ask": ask, "bid": bid, "fee": fee,
+            "p": p, "ask": ask, "bid": bid, "fee": fee, "depth": depth,
             "spread": (ask - bid) if bid is not None else None,
             "breakeven": be, "edge": p - be, "req_p": be + req,
             "win": 1 - be, "loss": -be,
@@ -649,14 +862,12 @@ def decide(p_yes: float, q: dict, tau_min: float, cfg: Cfg, calibrated: bool,
     fl: List[dict] = out["filters"]
     valid = {k: v for k, v in out["sides"].items() if v}
 
-    # 1) precios de compra
     if valid:
         fl.append(mkf("quotes", "Precios de compra de Kalshi", "ok",
                       " · ".join(f"{k} {cents(v['ask'])}" for k, v in valid.items())))
     else:
         fl.append(mkf("quotes", "Precios de compra de Kalshi", "fail", "sin precios", "",
                       "Kalshi no muestra precios de compra válidos."))
-    # 2) tiempo restante
     t_ok = tau_min >= cfg.min_tau_min
     fl.append(mkf("time_left", "Tiempo restante", "ok" if t_ok else "fail", f"{tau_min * 60:.0f} s",
                   f"≥ {cfg.min_tau_min * 60:.0f} s",
@@ -665,7 +876,6 @@ def decide(p_yes: float, q: dict, tau_min: float, cfg: Cfg, calibrated: bool,
     if valid:
         side, s = max(valid.items(), key=lambda kv: kv[1]["edge"])
         out["best"] = side
-        # 3) ventaja neta
         e_ok = s["edge"] >= req
         imposible = s["req_p"] > 0.995
         det = (f"Mejor opción ({side}): el modelo da {pct(s['p'])} y el costo de equilibrio es {pct(s['breakeven'])} "
@@ -675,12 +885,10 @@ def decide(p_yes: float, q: dict, tau_min: float, cfg: Cfg, calibrated: bool,
                + (" (el modelo nunca pasa de 99.5 %: a este precio no puede haber señal)." if imposible else "."))
         fl.append(mkf("edge", f"Ventaja neta mínima ({side})", "ok" if e_ok else "fail",
                       f"{s['edge'] * 100:+.1f}¢", f"≥ {req * 100:.1f}¢", "" if e_ok else det))
-        # 4) rango de precio de entrada
         r_ok = cfg.min_entry <= s["ask"] <= cfg.max_entry
         fl.append(mkf("entry", "Rango del precio de entrada", "ok" if r_ok else "fail", cents(s["ask"]),
                       f"{cfg.min_entry * 100:.0f}¢–{cfg.max_entry * 100:.0f}¢",
                       "" if r_ok else f"Precio de entrada {cents(s['ask'])} fuera del rango permitido."))
-        # 5) spread
         if s["spread"] is None:
             fl.append(mkf("spread", "Spread máximo", "warn", "sin precio de venta", f"≤ {cfg.max_spread * 100:.0f}¢",
                           "No hay precio de venta para medir el spread (no bloquea).", blocking=False))
@@ -689,10 +897,18 @@ def decide(p_yes: float, q: dict, tau_min: float, cfg: Cfg, calibrated: bool,
             fl.append(mkf("spread", "Spread máximo", "ok" if sp_ok else "fail", cents(s["spread"]),
                           f"≤ {cfg.max_spread * 100:.0f}¢",
                           "" if sp_ok else f"Spread de {cents(s['spread'])} supera el máximo de {cfg.max_spread * 100:.0f}¢."))
+        if s["depth"] is None:
+            fl.append(mkf("depth", "Liquidez (contratos disponibles)", "warn", "no informada", f"≥ {cfg.min_depth:.0f}",
+                          "Kalshi no informó cuántos contratos hay a ese precio (no bloquea).", blocking=False))
+        else:
+            dp_ok = s["depth"] >= cfg.min_depth
+            fl.append(mkf("depth", "Liquidez (contratos disponibles)", "ok" if dp_ok else "fail",
+                          f"{s['depth']:,.0f} contratos", f"≥ {cfg.min_depth:.0f}",
+                          "" if dp_ok else f"Solo hay {s['depth']:,.0f} contratos al precio de entrada: la orden "
+                          "probablemente se ejecutaría a un precio peor."))
     else:
-        for fid, name in DECISION_FILTERS[2:5]:
+        for fid, name in DECISION_FILTERS[2:6]:
             fl.append(mkf(fid, name, "na", blocking=False))
-    # 6) incertidumbre
     st_u = {"Baja": "ok", "Media": "warn", "Alta": "fail"}[unc_label]
     fl.append(mkf("uncertainty", "Incertidumbre", st_u, unc_label, "no ser 'Alta' (4+ puntos)",
                   ("Incertidumbre alta: " + unc_detail) if st_u == "fail" else unc_detail))
@@ -771,12 +987,10 @@ def run_backtest(df_raw: pd.DataFrame, cfg: Cfg, elapsed_points=(3, 6, 9, 12), t
     R["set"] = np.where(R["window"] < cut, "train", "test")
     tr = R[R["set"] == "train"]
 
-    # 1) ¿el score (tendencia/momentum) mejora al benchmark sin tendencia? (decidido con TRAIN)
     drift_supported = _brier(tr["p_raw"].to_numpy(), tr["y"].to_numpy()) < \
         _brier(tr["p_nd"].to_numpy(), tr["y"].to_numpy()) - 1.5e-3
     base_col = "p_raw" if drift_supported else "p_nd"
 
-    # 2) ¿la calibración de Platt ayuda? se ajusta con 70 % de TRAIN y se comprueba con el 30 % final de TRAIN
     twins = sorted(tr["window"].unique())
     cut2 = twins[int(len(twins) * 0.7)]
     t_a, t_b = tr[tr["window"] < cut2], tr[tr["window"] >= cut2]
@@ -788,7 +1002,6 @@ def run_backtest(df_raw: pd.DataFrame, cfg: Cfg, elapsed_points=(3, 6, 9, 12), t
     R["p_used"] = 1 / (1 + np.exp(-(a * logit(R[base_col].to_numpy()) + b))) if platt_ok else R[base_col]
     R["p_used"] = R["p_used"].clip(0.005, 0.995)
 
-    # 3) Señales con la misma función de decisión que usa la app en vivo
     sigs, pnls, wins_l = [], [], []
     for _, r in R.iterrows():
         pm = float(r["p_nd"])                               # "precio justo" simulado del mercado
@@ -828,7 +1041,6 @@ def run_backtest(df_raw: pd.DataFrame, cfg: Cfg, elapsed_points=(3, 6, 9, 12), t
     test = R[R["set"] == "test"]
     sm_tr, sm_te = summarize(R[R["set"] == "train"]), summarize(test)
 
-    # tabla de fiabilidad (test)
     bins = np.linspace(0, 1, 11)
     tb = test.assign(bin=pd.cut(test["p_used"], bins, include_lowest=True))
     rel = tb.groupby("bin", observed=True).agg(n=("y", "size"), p_media=("p_used", "mean"),
@@ -847,6 +1059,327 @@ def run_backtest(df_raw: pd.DataFrame, cfg: Cfg, elapsed_points=(3, 6, 9, 12), t
 # ──────────────────────────────────────────────────────────────────────────────
 # ESTADO, HISTORIAL Y UTILIDADES DE UI
 # ──────────────────────────────────────────────────────────────────────────────
+
+# ──────────────────────────────────────────────────────────────────────────────
+# OPERACIÓN AUTOMÁTICA (órdenes en Kalshi) — APAGADA por defecto
+# ──────────────────────────────────────────────────────────────────────────────
+# Capas de seguridad: (1) modo Apagado/Simulación/REAL; (2) REAL exige KALSHI_LIVE_OK=1 + escribir OPERAR;
+# (3) solo con semáforo VERDE y la misma señal en N lecturas seguidas; (4) órdenes límite fill-or-kill (nunca
+# quedan órdenes abiertas); (5) tope por operación, por día, pérdida diaria y exposición; (6) UNA orden por
+# contrato (registro en trade_log.csv + client_order_id fijo); (7) si una orden queda en duda (timeout/5xx)
+# se DETIENE todo hasta que la revises en tu cuenta. Las órdenes POST nunca se reintentan solas.
+KALSHI_TRADE_BASE = os.getenv("KALSHI_TRADE_BASE", KALSHI_BASE)
+TRADE_LOG = "trade_log.csv"
+TRADE_COLS = ["ts_utc", "modo", "ticker", "lado", "contratos", "precio_limite", "estado", "order_id", "fill",
+              "costo", "comision", "cierre_utc", "resultado", "pnl", "error"]
+_TRADE_LOCK = threading.Lock()
+
+
+@dataclass
+class TradeCfg:
+    mode: str = "off"              # off | dry | live
+    contracts: int = 1
+    max_cost: float = 5.0          # $ máximo por operación (precio límite + comisión) × contratos
+    max_trades_day: int = 5        # intentos REALES máximos por día (UTC)
+    max_daily_loss: float = 10.0   # $ de pérdida realizada del día que detiene la operación
+    max_exposure: float = 10.0     # $ máximo en operaciones aún sin resolver
+    confirm_reads: int = 2         # lecturas seguidas con la MISMA señal antes de enviar
+    live_unlocked: bool = False    # KALSHI_LIVE_OK=1 y confirmación escrita
+
+
+def kalshi_creds() -> Tuple[Optional[str], Optional[bytes]]:
+    """Claves SOLO desde variables de entorno (o st.secrets). Nunca van en el código."""
+    key_id = os.getenv("KALSHI_API_KEY_ID")
+    pem = os.getenv("KALSHI_PRIVATE_KEY_PEM")
+    path = os.getenv("KALSHI_PRIVATE_KEY_PATH")
+    try:
+        if not key_id and "KALSHI_API_KEY_ID" in st.secrets:
+            key_id = st.secrets["KALSHI_API_KEY_ID"]
+        if not pem and not path and "KALSHI_PRIVATE_KEY_PEM" in st.secrets:
+            pem = st.secrets["KALSHI_PRIVATE_KEY_PEM"]
+    except Exception:
+        pass
+    data: Optional[bytes] = None
+    if pem:
+        data = pem.replace("\\n", "\n").encode()
+    elif path and os.path.exists(os.path.expanduser(path)):
+        with open(os.path.expanduser(path), "rb") as fh:
+            data = fh.read()
+    return key_id, data
+
+
+def kalshi_sign(method: str, path: str, ts_ms: str, pem: bytes) -> str:
+    """RSA-PSS/SHA-256 sobre  timestamp_ms + MÉTODO + ruta (con /trade-api/v2, SIN query string)."""
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding
+    key = serialization.load_pem_private_key(pem, password=None)
+    sig = key.sign(f"{ts_ms}{method.upper()}{path}".encode(),
+                   padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH),
+                   hashes.SHA256())
+    return base64.b64encode(sig).decode()
+
+
+def kalshi_private(method: str, path: str, body: Optional[dict] = None, timeout: Tuple[float, float] = (3.5, 8.0)) -> Any:
+    """Solicitud firmada. SIN reintentos. HTTP ≥ 400 → RuntimeError('HTTP n: ...'); fallos de red → requests.RequestException."""
+    key_id, pem = kalshi_creds()
+    if not key_id or not pem:
+        raise RuntimeError("Faltan credenciales: define KALSHI_API_KEY_ID y KALSHI_PRIVATE_KEY_PATH (o _PEM).")
+    ts = str(int(time.time() * 1000))
+    full = urlparse(KALSHI_TRADE_BASE).path.rstrip("/") + path
+    headers = {"User-Agent": UA["User-Agent"], "Accept": "application/json", "Content-Type": "application/json",
+               "KALSHI-ACCESS-KEY": key_id, "KALSHI-ACCESS-TIMESTAMP": ts,
+               "KALSHI-ACCESS-SIGNATURE": kalshi_sign(method, full, ts, pem)}
+    r = get_session().request(method, KALSHI_TRADE_BASE + path, headers=headers,
+                              data=None if body is None else json.dumps(body), timeout=timeout)
+    if r.status_code >= 400:
+        raise RuntimeError(f"HTTP {r.status_code}: {r.text[:240]}")
+    return r.json()
+
+
+def ceil_cent(x: float) -> float:
+    return min(math.ceil(x * 100 - 1e-9) / 100, 0.99)
+
+
+def build_order_body(ticker: str, side_ui: str, count: int, limit_price: float, client_id: str) -> dict:
+    """Orden límite de COMPRA, fill-or-kill (se ejecuta completa al instante o se cancela; no queda abierta)."""
+    side = "yes" if side_ui == "UP" else "no"
+    return {"ticker": ticker, "side": side, "action": "buy", "client_order_id": client_id,
+            "count": int(count), "count_fp": f"{int(count):.2f}",
+            ("yes_price_dollars" if side == "yes" else "no_price_dollars"): f"{limit_price:.4f}",
+            "time_in_force": "fill_or_kill"}
+
+
+def client_order_id_for(ticker: str) -> str:
+    return "b-" + re.sub(r"[^A-Za-z0-9-]", "-", ticker)[:60]   # fijo por contrato: Kalshi rechaza duplicados
+
+
+def load_trades() -> List[dict]:
+    try:
+        if os.path.exists(TRADE_LOG):
+            return pd.read_csv(TRADE_LOG, dtype=str).replace({np.nan: None}).to_dict("records")
+    except Exception:
+        pass
+    return []
+
+
+def save_trades(rows: List[dict]) -> None:
+    try:
+        pd.DataFrame(rows, columns=TRADE_COLS).to_csv(TRADE_LOG, index=False)
+    except Exception:
+        pass
+
+
+def today_stats(rows: List[dict], now: datetime) -> dict:
+    day = now.strftime("%Y-%m-%d")
+    live = [r for r in rows if r.get("modo") == "live"]
+    attempts = [r for r in live if str(r.get("ts_utc", "")).startswith(day)]
+    realized = sum(_to_float(r.get("pnl")) or 0.0 for r in live
+                   if str(r.get("cierre_utc", "")).startswith(day) and r.get("pnl") not in (None, ""))
+    exposure = sum((_to_float(r.get("costo")) or 0.0) + (_to_float(r.get("comision")) or 0.0) for r in live
+                   if (_to_float(r.get("fill")) or 0) > 0 and not r.get("resultado"))
+    return {"attempts": len(attempts), "realized": realized, "exposure": exposure}
+
+
+def trade_guard(R: dict, cfg: Cfg, tcfg: TradeCfg, rows: List[dict], now: datetime,
+                streak: int, halted: Optional[str]) -> Tuple[List[str], dict]:
+    """Devuelve (motivos por los que NO se envía, plan). Lista vacía = se puede enviar."""
+    why: List[str] = []
+    plan: dict = {}
+    if halted:
+        why.append(f"Operación detenida: {halted}")
+    if R["signal"] not in ("BUY UP", "BUY DOWN") or R["ctr"] is None or not R["dec"].get("side"):
+        why.append("no hay señal BUY")
+        return why, plan
+    if R["fresh"]["level"] != "green":
+        why.append("el semáforo de frescura no está verde")
+    if streak < tcfg.confirm_reads:
+        why.append(f"la señal debe repetirse {tcfg.confirm_reads} lecturas seguidas (lleva {streak})")
+    ticker, side = R["ctr"].ticker, R["dec"]["side"]
+    s = R["dec"]["sides"][side]
+    count = int(tcfg.contracts)
+    limit = ceil_cent(s["ask"])
+    fee = kalshi_fee(limit, cfg.fee_rate)
+    cost = count * (limit + fee)
+    plan = {"ticker": ticker, "side": side, "count": count, "limit": limit, "cost": cost, "fee": fee * count}
+    if cost > tcfg.max_cost:
+        why.append(f"costo estimado ${cost:.2f} supera el tope por operación (${tcfg.max_cost:.2f})")
+    if s["p"] - (limit + fee) < R["dec"]["req_edge"] - 1e-9:
+        why.append("la ventaja al precio límite (redondeado al centavo) ya no alcanza el mínimo")
+    if s.get("depth") is not None and s["depth"] < count:
+        why.append(f"solo hay {s['depth']:.0f} contratos disponibles")
+    if any(r.get("ticker") == ticker and r.get("modo") == tcfg.mode for r in rows):
+        why.append("ya se intentó una orden en este contrato (máximo una por contrato)")
+    if tcfg.mode == "live":
+        st_ = today_stats(rows, now)
+        if st_["attempts"] >= tcfg.max_trades_day:
+            why.append(f"límite diario de {tcfg.max_trades_day} operaciones alcanzado")
+        if st_["realized"] <= -tcfg.max_daily_loss:
+            why.append(f"pérdida realizada del día (${-st_['realized']:.2f}) alcanzó el límite (${tcfg.max_daily_loss:.2f})")
+        if st_["exposure"] + cost > tcfg.max_exposure:
+            why.append(f"exposición sin resolver (${st_['exposure']:.2f}) + esta orden superaría ${tcfg.max_exposure:.2f}")
+    return why, plan
+
+
+def _parse_fill(order: dict) -> Tuple[float, float, float]:
+    fill = _to_float(order.get("fill_count_fp"))
+    if fill is None:
+        fill = _to_float(order.get("fill_count")) or 0.0
+    cost = _to_float(order.get("taker_fill_cost_dollars"))
+    if cost is None:
+        c = _to_float(order.get("taker_fill_cost"))
+        cost = (c / 100.0) if c is not None else 0.0
+    fees = _to_float(order.get("taker_fees_dollars"))
+    if fees is None:
+        f_ = _to_float(order.get("taker_fees"))
+        fees = (f_ / 100.0) if f_ is not None else 0.0
+    return fill, cost, fees
+
+
+def auto_trade(R: dict, cfg: Cfg, tcfg: TradeCfg) -> None:
+    ss = st.session_state
+    sig = R["signal"]
+    key = (R["ctr"].ticker if R["ctr"] else None, sig)
+    ss["sig_streak"] = (ss.get("sig_streak", 0) + 1) if (sig.startswith("BUY") and ss.get("sig_key") == key) \
+        else (1 if sig.startswith("BUY") else 0)
+    ss["sig_key"] = key
+    if tcfg.mode == "off":
+        return
+    if tcfg.mode == "live" and not tcfg.live_unlocked:
+        ss["trade_msg"] = "Modo REAL bloqueado: define KALSHI_LIVE_OK=1 y escribe OPERAR en la barra lateral."
+        return
+    if not sig.startswith("BUY"):
+        return
+    now = R["now"]
+    with _TRADE_LOCK:
+        rows = load_trades()
+        why, plan = trade_guard(R, cfg, tcfg, rows, now, ss["sig_streak"], ss.get("trading_halt"))
+        if why:
+            ss["trade_msg"] = "Orden NO enviada: " + "; ".join(why)
+            return
+        cid = client_order_id_for(plan["ticker"])
+        row = {"ts_utc": now.strftime("%Y-%m-%d %H:%M:%S"), "modo": tcfg.mode, "ticker": plan["ticker"],
+               "lado": plan["side"], "contratos": plan["count"], "precio_limite": plan["limit"], "estado": "",
+               "order_id": None, "fill": None, "costo": None, "comision": None,
+               "cierre_utc": R["ctr"].close_time.strftime("%Y-%m-%d %H:%M:%S"), "resultado": None, "pnl": None,
+               "error": None}
+        if tcfg.mode == "dry":
+            row["estado"] = "simulada"
+            rows.append(row)
+            save_trades(rows)
+            ss["trade_msg"] = (f"SIMULACIÓN: compraría {plan['count']} × {plan['side']} en {plan['ticker']} "
+                               f"a ≤ {cents(plan['limit'])} (costo ≈ ${plan['cost']:.2f}). No se envió nada.")
+            return
+        body = build_order_body(plan["ticker"], plan["side"], plan["count"], plan["limit"], cid)
+        try:
+            resp = kalshi_private("POST", "/portfolio/orders", body)
+            order = resp.get("order", resp) if isinstance(resp, dict) else {}
+            fill, cost, fees = _parse_fill(order)
+            row.update({"order_id": order.get("order_id"), "fill": fill, "costo": cost, "comision": fees,
+                        "estado": "ejecutada" if fill > 0 else "sin_ejecución"})
+            ss["trade_msg"] = (f"ORDEN {row['estado'].upper()}: {plan['count']} × {plan['side']} {plan['ticker']} "
+                               f"límite {cents(plan['limit'])} · llenados {fill:.0f} · costo ${cost:.2f}")
+        except RuntimeError as e:
+            msg = str(e)
+            m_ = re.match(r"HTTP (\d+)", msg)
+            if m_ and int(m_.group(1)) < 500:
+                row.update({"estado": "rechazada", "error": msg[:200]})
+                ss["trade_msg"] = "Kalshi RECHAZÓ la orden: " + msg[:200]
+            else:
+                row.update({"estado": "INCIERTA", "error": msg[:200]})
+                ss["trading_halt"] = "una orden quedó en duda (error del servidor); revisa tu cuenta de Kalshi y reinicia la app"
+                ss["trade_msg"] = "⚠️ Resultado de la orden INCIERTO. Operación detenida. Revisa tu cuenta de Kalshi: " + msg[:160]
+        except requests.RequestException as e:
+            row.update({"estado": "INCIERTA", "error": f"{type(e).__name__}"})
+            ss["trading_halt"] = "una orden quedó en duda (fallo de red); revisa tu cuenta de Kalshi y reinicia la app"
+            ss["trade_msg"] = "⚠️ Resultado de la orden INCIERTO (fallo de red). Operación detenida. Revisa tu cuenta de Kalshi."
+        except Exception as e:  # noqa: BLE001  (p. ej. falta 'cryptography' o clave inválida: la orden NO salió)
+            row.update({"estado": "no_enviada", "error": f"{type(e).__name__}: {str(e)[:160]}"})
+            ss["trade_msg"] = f"No se envió la orden: {type(e).__name__}: {str(e)[:160]}"
+        rows.append(row)
+        save_trades(rows)
+
+
+def resolve_trades(now: datetime) -> None:
+    """Calcula el resultado y el P&L real de órdenes REALES ya vencidas (consulta a Kalshi, máx. 2 por pasada)."""
+    with _TRADE_LOCK:
+        rows = load_trades()
+        done, cache = 0, {}
+        for r in rows:
+            if r.get("modo") != "live" or r.get("resultado") or (_to_float(r.get("fill")) or 0) <= 0:
+                continue
+            try:
+                close = pd.to_datetime(r["cierre_utc"], utc=True).to_pydatetime()
+            except Exception:
+                continue
+            if now < close + timedelta(seconds=90) or done >= 2:
+                continue
+            t = r["ticker"]
+            if t not in cache:
+                try:
+                    cache[t] = fetch_kalshi_market_result(t)
+                except Exception:
+                    cache[t] = None
+                done += 1
+            res = cache[t]
+            if res:
+                won = (r["lado"] == "UP" and res == "yes") or (r["lado"] == "DOWN" and res == "no")
+                fill, cost, fees = (_to_float(r.get("fill")) or 0), (_to_float(r.get("costo")) or 0), (_to_float(r.get("comision")) or 0)
+                r["resultado"], r["pnl"] = res, round((fill - cost - fees) if won else -(cost + fees), 4)
+        if done:
+            save_trades(rows)
+
+
+def render_trading(R: dict, cfg: Cfg, tcfg: TradeCfg) -> None:
+    ss = st.session_state
+    label = {"off": "APAGADA", "dry": "SIMULACIÓN (no envía nada)", "live": "REAL (envía órdenes)"}[tcfg.mode]
+    key_id, pem = kalshi_creds()
+    try:
+        import cryptography  # noqa: F401
+        crypto_ok = True
+    except Exception:
+        crypto_ok = False
+    rows = load_trades()
+    with st.expander(f"🤖 Operación automática · {label}", expanded=(tcfg.mode != "off")):
+        if ss.get("trading_halt"):
+            st.markdown(f"<div class='why'>⛔ <b>Operación detenida</b><br>{esc(ss['trading_halt'])}</div>", unsafe_allow_html=True)
+        if tcfg.mode == "live" and not tcfg.live_unlocked:
+            st.markdown("<div class='why'>🔒 Modo REAL bloqueado hasta definir <b>KALSHI_LIVE_OK=1</b> y escribir "
+                        "<b>OPERAR</b> en la barra lateral.</div>", unsafe_allow_html=True)
+        if ss.get("trade_msg"):
+            st.markdown(f"<div class='note'>{esc(ss['trade_msg'])}</div>", unsafe_allow_html=True)
+        stt = today_stats(rows, R["now"])
+        st.markdown(kv_html([
+            ("Entorno de órdenes", KALSHI_TRADE_BASE), ("Credenciales", "cargadas" if (key_id and pem) else "NO definidas"),
+            ("Librería 'cryptography'", "instalada" if crypto_ok else "falta (pip install cryptography)"),
+            ("Contratos por orden / tope por orden", f"{tcfg.contracts} / ${tcfg.max_cost:.2f}"),
+            ("Intentos reales hoy (UTC)", f"{stt['attempts']} / {tcfg.max_trades_day}"),
+            ("P&L realizado hoy", f"${stt['realized']:+.2f} (límite −${tcfg.max_daily_loss:.2f})"),
+            ("Exposición sin resolver", f"${stt['exposure']:.2f} (máx. ${tcfg.max_exposure:.2f})"),
+            ("Lecturas seguidas de la señal", f"{ss.get('sig_streak', 0)} / {tcfg.confirm_reads}")]), unsafe_allow_html=True)
+        c1, c2 = st.columns(2)
+        if c1.button("Probar credenciales"):
+            try:
+                b = kalshi_private("GET", "/portfolio/balance")
+                bal = b.get("balance_dollars") if isinstance(b, dict) and b.get("balance_dollars") is not None else \
+                    (None if not isinstance(b, dict) or b.get("balance") is None else float(b["balance"]) / 100)
+                st.success(f"Conexión firmada correcta. Saldo: {fnum(bal, 2, '$')}" if bal is not None else
+                           "Conexión firmada correcta (respuesta sin saldo reconocible).")
+            except Exception as e:  # noqa: BLE001
+                st.error(f"{type(e).__name__}: {str(e)[:200]}")
+        if c2.button("⛔ Detener operación"):
+            ss["trading_halt"] = "detenida manualmente (reinicia la app para reanudar)"
+            st.warning("Operación detenida.")
+        if rows:
+            last = [[r["ts_utc"][11:19] if r.get("ts_utc") else "—", r.get("modo"), str(r.get("ticker", "")).replace(SERIES + "-", ""),
+                     r.get("lado"), r.get("estado"), fnum(_to_float(r.get("pnl")), 2, "$") if r.get("pnl") else "—"]
+                    for r in rows[::-1][:8]]
+            st.markdown(table_html(["Hora UTC", "Modo", "Contrato", "Lado", "Estado", "P&L"], last), unsafe_allow_html=True)
+            st.download_button("Descargar registro de operaciones (CSV)", pd.DataFrame(rows, columns=TRADE_COLS).to_csv(index=False).encode("utf-8"),
+                               file_name="trade_log.csv", mime="text/csv")
+        st.caption("Las órdenes son límite fill-or-kill: se ejecutan completas al instante o se cancelan. "
+                   "Una señal es una estimación, no una garantía: puedes perder lo que operes.")
+
+
 HIST_COLS = ["hora_utc", "contrato", "señal", "btc", "referencia", "yes_ask", "no_ask", "prob_modelo",
              "ventaja", "seg_restantes", "incertidumbre", "motivo", "bloqueo", "cierre_utc", "resultado", "acierto"]
 
@@ -875,20 +1408,31 @@ def init_state() -> None:
     ss.setdefault("bt", None)
     ss.setdefault("wait_counts", {})
     ss.setdefault("wait_total", 0)
+    ss.setdefault("data_log", {"refresh_n": 0, "last_candle_start": None, "last_new_candle_at": None,
+                               "last_price": None, "last_price_change_at": None})
 
 
-def safe_fetch(name: str, fn) -> Tuple[Optional[dict], bool]:
-    """Devuelve (datos, falló). Si falla, conserva la última lectura buena (se marcará como antigua)."""
+def safe_fetch(name: str, fn: Callable[[], dict], min_s: float) -> Tuple[Optional[dict], bool]:
+    """Devuelve (datos, último_intento_falló).
+
+    * Hay una descarga REAL como máximo cada `min_s` segundos; entre medias solo se redibuja la pantalla con la
+      última lectura buena, que conserva su hora de descarga ORIGINAL (nunca se hace pasar por reciente).
+    * Si falla, se conserva la última lectura buena y su antigüedad real la hará bloquear la señal."""
     ss = st.session_state
+    t = time.time()
+    prev = ss.status.get(name, {})
+    if prev.get("last_try") and t - prev["last_try"] < min_s and name in ss.last_good:
+        return ss.last_good[name], not prev.get("ok", False)
     try:
         out = fn()
         ss.last_good[name] = out
-        ss.status[name] = {"ok": True, "error": None, "ok_at": out["fetched_at"], "latency_ms": out.get("latency_ms")}
+        ss.status[name] = {"ok": True, "error": None, "ok_at": out["fetched_at"], "latency_ms": out.get("latency_ms"),
+                           "last_try": t, "fails": 0, "n_ok": prev.get("n_ok", 0) + 1}
         return out, False
     except Exception as e:  # noqa: BLE001
-        prev = ss.status.get(name, {})
-        ss.status[name] = {"ok": False, "error": f"{type(e).__name__}: {str(e)[:160]}",
-                           "ok_at": prev.get("ok_at"), "latency_ms": None}
+        ss.status[name] = {"ok": False, "error": f"{type(e).__name__}: {str(e)[:220]}", "ok_at": prev.get("ok_at"),
+                           "latency_ms": None, "last_try": t, "fails": prev.get("fails", 0) + 1,
+                           "n_ok": prev.get("n_ok", 0)}
         return ss.last_good.get(name), True
 
 
@@ -908,11 +1452,10 @@ CSS = """
 section[data-testid="stSidebar"] {background:#120e24;border-right:1px solid #2b2150;}
 h1,h2,h3,h4,h5 {color:#e9e5f5;}
 h3 {font-size:1.25rem !important;} h4,h5 {font-size:1.02rem !important;}
-/* columnas SIEMPRE lado a lado (en celular Streamlit las apila por defecto) */
 [data-testid="stHorizontalBlock"] {flex-wrap: nowrap !important; gap: .45rem !important;}
 [data-testid="stHorizontalBlock"] > [data-testid="stColumn"],
 [data-testid="stHorizontalBlock"] > [data-testid="column"] {min-width: 0 !important; flex: 1 1 0 !important; width: auto !important;}
-div[data-testid="stMetric"] {background:#1a1530;border:1px solid #2f2459;border-radius:12px;padding:7px 10px;}
+div[data-testid="stMetric"] {background:#1a1530;border:1px solid #f59e0b55;border-radius:12px;padding:7px 10px;}
 div[data-testid="stMetricValue"] {color:#c4b5fd; font-size:1.18rem;}
 div[data-testid="stMetricLabel"] p {font-size:.72rem;}
 button, [role="tab"] {min-height:44px;}
@@ -939,6 +1482,12 @@ button, [role="tab"] {min-height:44px;}
 .fm .fv {font-weight:600;color:#fff;margin-right:.6rem;}
 .fm .fl {color:#9a90c4;}
 .fd {font-size:.78rem;color:#f3d9d9;margin-top:3px;line-height:1.3;}
+.fresh {border:2px solid;border-radius:14px;padding:.5rem .7rem;margin:.5rem 0 .3rem;background:#161129;}
+.fresh.green {border-color:#22c55e;} .fresh.yellow {border-color:#f59e0b;} .fresh.red {border-color:#ef4444;}
+.fresh .t {font-weight:700;font-size:.9rem;color:#ece8fa;}
+.dot {display:inline-block;width:.8rem;height:.8rem;border-radius:50%;margin-right:.45rem;vertical-align:-1px;}
+.dot.green {background:#22c55e;box-shadow:0 0 8px #22c55e;} .dot.yellow {background:#f59e0b;box-shadow:0 0 8px #f59e0b;}
+.dot.red {background:#ef4444;box-shadow:0 0 8px #ef4444;}
 table.kv, table.tb {width:100%;border-collapse:collapse;font-size:.8rem;margin:.2rem 0 .5rem;}
 table.kv td {padding:3px 4px;border-bottom:1px solid #2b2150;vertical-align:top;}
 table.kv td.k {color:#a78bfa;width:52%;} table.kv td.v {text-align:right;color:#f1edfb;word-break:break-word;}
@@ -1038,11 +1587,14 @@ def factor_lines(row: pd.Series, direction: int) -> Tuple[List[str], List[str]]:
 # ANÁLISIS EN VIVO (calcula todo y devuelve un diccionario; sin dibujar nada)
 # ──────────────────────────────────────────────────────────────────────────────
 def analyze(cfg: Cfg, forced: Optional[str]) -> dict:
+    ss = st.session_state
     now = utcnow()
-    tick, tick_fail = safe_fetch("Coinbase · precio", fetch_ticker)
-    cand, cand_fail = safe_fetch("Coinbase · velas 1m", fetch_candles)
-    kal, kal_fail = safe_fetch("Kalshi · mercados", fetch_kalshi_markets)
-    stat = st.session_state.status
+    dl = ss.data_log
+    dl["refresh_n"] += 1
+    tick, tick_fail = safe_fetch("Coinbase · precio", fetch_ticker, 3)
+    cand, cand_fail = safe_fetch("Coinbase · velas 1m", lambda: fetch_candles(cfg.stale_trigger_s), 5)
+    kal, kal_fail = safe_fetch("Kalshi · mercados", fetch_kalshi_markets, 4)
+    stat = ss.status
     F: List[dict] = []
 
     def add(fid, name, state, value="", limit="", detail="", blocking=True):
@@ -1058,17 +1610,21 @@ def analyze(cfg: Cfg, forced: Optional[str]) -> dict:
     # ── 1. Precio de Coinbase ──
     a = age_of(tick)
     lim_age = f"≤ {cfg.max_age_s} s"
-    if tick is None:
-        add("price", "Precio BTC (Coinbase)", "fail", "sin datos", lim_age,
-            "Precio de Coinbase no disponible o desactualizado." + err_of("Coinbase · precio"))
-    elif tick_fail or a > cfg.max_age_s:
-        add("price", "Precio BTC (Coinbase)", "fail", f"dato de hace {a:.0f} s", lim_age,
-            "Precio de Coinbase no disponible o desactualizado." + err_of("Coinbase · precio"))
+    if tick is None or a > cfg.max_age_s:
+        add("price", "Precio BTC (Coinbase)", "fail", "sin datos" if tick is None else f"dato de hace {a:.0f} s",
+            lim_age, "Precio de Coinbase no disponible o desactualizado." + err_of("Coinbase · precio"))
+    elif tick_fail:
+        add("price", "Precio BTC (Coinbase)", "warn", f"{fnum(tick['price'], 2, '$')} · hace {a:.1f} s", lim_age,
+            "El último intento falló; se usa la lectura anterior (aún dentro del límite)."
+            + err_of("Coinbase · precio"), blocking=False)
     else:
         add("price", "Precio BTC (Coinbase)", "ok", f"{fnum(tick['price'], 2, '$')} · hace {a:.1f} s", lim_age)
+        if dl["last_price"] != tick["price"]:
+            dl["last_price"], dl["last_price_change_at"] = tick["price"], tick["fetched_at"]
 
     # ── 2. Hora de la última operación de Coinbase ──
     ex = None if tick is None else tick.get("exchange_time")
+    ta = None
     if ex is None:
         add("trade_time", "Hora de la última operación", "warn", "sin hora", f"≤ {cfg.max_trade_age_s} s",
             "Coinbase no informó la hora de la última operación (no bloquea).", blocking=False)
@@ -1084,33 +1640,57 @@ def analyze(cfg: Cfg, forced: Optional[str]) -> dict:
 
     # ── 3. Velas e indicadores ──
     closed = f = forming = row = None
-    n_gap = 0
-    lag = None
+    n_gap, lag, gaps = 0, None, (0, 0)
     if cand is not None:
-        df = cand["df"]
-        end_closed = df["time"] + pd.Timedelta(seconds=60) <= pd.Timestamp(now)
-        closed_raw, fm = df[end_closed], df[~end_closed]
+        closed_raw, fm = split_closed(cand["df"], now)
         if len(closed_raw):
-            closed, n_gap = fill_gaps(closed_raw.reset_index(drop=True))
-            last_end = closed["time"].iloc[-1].to_pydatetime() + timedelta(seconds=60)
-            lag = (now - last_end).total_seconds()
+            gaps = gap_stats(closed_raw)
+            closed, n_gap = fill_gaps(closed_raw)
+            lag = candle_age_s(closed, now)
             f = compute_features(closed)
             row = f.iloc[-1]
+            last_start = closed["time"].iloc[-1].to_pydatetime()
+            if dl["last_candle_start"] != last_start:       # llegó una vela cerrada NUEVA (no solo se redibujó)
+                dl["last_candle_start"], dl["last_new_candle_at"] = last_start, cand["fetched_at"]
         if len(fm):
             forming = fm.iloc[-1]
-    lim_c = f"retraso ≤ {CANDLE_MAX_LAG_S} s"
-    if cand is None or cand_fail:
+    src = "" if cand is None else cand.get("source", "")
+    lim_c = f"antigüedad ≤ {cfg.candle_max_s} s"
+    if cand is None:
         add("candles", "Velas de 1 min (Coinbase)", "fail", "sin datos", lim_c,
-            "Velas de Coinbase no disponibles o desactualizadas." + err_of("Coinbase · velas 1m"))
+            "Velas de Coinbase no disponibles." + err_of("Coinbase · velas 1m"))
     elif closed is None:
         add("candles", "Velas de 1 min (Coinbase)", "fail", "0 velas cerradas", lim_c,
             "Coinbase no devolvió ninguna vela cerrada.")
-    elif lag > CANDLE_MAX_LAG_S:
-        add("candles", "Velas de 1 min (Coinbase)", "fail", f"última vela cerró hace {lag:.0f} s", lim_c,
-            "La última vela cerrada de Coinbase está atrasada (> 2.5 min).")
+    elif lag > cfg.candle_max_s:
+        add("candles", "Velas de 1 min (Coinbase)", "fail", f"última vela cerró hace {lag:.0f} s · {src}", lim_c,
+            f"La última vela cerrada de Coinbase ({loc(closed['time'].iloc[-1].to_pydatetime())}) tiene {lag:.0f} s "
+            f"de antigüedad (máximo {cfg.candle_max_s} s). Ninguna fuente entregó datos más recientes: las señales "
+            "que dependen de ella quedan bloqueadas. Revisa el panel de diagnóstico (fuentes de velas)."
+            + err_of("Coinbase · velas 1m"))
+    elif cand_fail:
+        add("candles", "Velas de 1 min (Coinbase)", "warn", f"última vela cerró hace {max(lag, 0):.0f} s · {src}", lim_c,
+            "El último intento de descarga falló; se usan las velas anteriores (aún dentro del límite)."
+            + err_of("Coinbase · velas 1m"), blocking=False)
     else:
         add("candles", "Velas de 1 min (Coinbase)", "ok",
-            f"{len(closed)} velas · última cerró hace {max(lag, 0):.0f} s", lim_c)
+            f"{len(closed)} velas · última cerró hace {max(lag, 0):.0f} s · {src}", lim_c)
+    if closed is not None:
+        g_all, g_10 = gaps
+        if g_10 > 2:
+            add("gaps", "Velas faltantes recientes", "fail", f"{g_10} faltan en los últimos 10 min", "≤ 2",
+                "Coinbase omitió varios minutos recientes: los indicadores no son fiables.")
+        else:
+            add("gaps", "Velas faltantes recientes", "ok" if g_all == 0 else "warn",
+                f"{g_all} huecos en el tramo ({g_10} en los últimos 10 min)", "≤ 2 recientes",
+                "Minutos sin operaciones: se rellenan planos (volumen 0) solo dentro del tramo." if g_all else "",
+                blocking=False)
+        rep = (cand or {}).get("report") or {}
+        bad = {k: v for k, v in rep.items() if k != "filas" and v}
+        add("candle_valid", "Validación de velas recibidas", "ok" if not bad else "warn",
+            f"{rep.get('filas', 0)} filas" + ("" if not bad else " · " + ", ".join(f"{k}: {v}" for k, v in bad.items())),
+            "", "Se descartaron/ordenaron filas inválidas, duplicadas, desalineadas o futuras." if bad else "",
+            blocking=False)
     if f is None:
         add("warmup", "Indicadores calculados", "na", blocking=False)
     else:
@@ -1119,32 +1699,34 @@ def analyze(cfg: Cfg, forced: Optional[str]) -> dict:
             "" if w_ok else f"Datos insuficientes para los indicadores (se necesitan ≥ {WARMUP} velas cerradas válidas).")
     add("forming", "Vela actual de Coinbase", "ok" if forming is not None else "warn",
         "presente" if forming is not None else "ausente", "",
-        "Coinbase aún no publicó la vela del minuto en curso (pasa en los primeros segundos de cada minuto). "
-        "Solo afecta a la gráfica; ya NO bloquea la señal.", blocking=False)
+        "Coinbase aún no publicó la vela del minuto en curso. Solo afecta a la gráfica; no bloquea la señal.",
+        blocking=False)
 
     # ── 4. Kalshi: frescura ──
     a_k = age_of(kal)
-    if kal is None:
-        add("kalshi", "Datos de Kalshi", "fail", "sin datos", lim_age,
+    if kal is None or a_k > cfg.max_age_s:
+        add("kalshi", "Datos de Kalshi", "fail", "sin datos" if kal is None else f"dato de hace {a_k:.0f} s", lim_age,
             "Datos de Kalshi no disponibles o desactualizados." + err_of("Kalshi · mercados"))
-    elif kal_fail or a_k > cfg.max_age_s:
-        add("kalshi", "Datos de Kalshi", "fail", f"dato de hace {a_k:.0f} s", lim_age,
-            "Datos de Kalshi no disponibles o desactualizados." + err_of("Kalshi · mercados"))
+    elif kal_fail:
+        add("kalshi", "Datos de Kalshi", "warn", f"descargados hace {a_k:.1f} s", lim_age,
+            "El último intento falló; se usa la lectura anterior (aún dentro del límite)."
+            + err_of("Kalshi · mercados"), blocking=False)
     else:
         add("kalshi", "Datos de Kalshi", "ok", f"descargados hace {a_k:.1f} s", lim_age)
 
-    # ── 5. Reloj local ──
+    # ── 5. Reloj local (hora de descarga vs. cabecera Date del servidor) ──
     signed = []
     for o in (tick, cand, kal):
         sd_ = o.get("server_date") if o else None
         if sd_ is not None:
             signed.append((o["fetched_at"] - sd_).total_seconds())
     if signed:
-        skew = min(signed)   # los sesgos (latencia, cachés) son siempre positivos: el mínimo es el más fiel
+        skew = min(signed)
         sk_ok = abs(skew) <= cfg.max_clock_skew_s
         add("clock", "Reloj del dispositivo/servidor", "ok" if sk_ok else "fail", f"desfase ≈ {skew:+.1f} s",
             f"±{cfg.max_clock_skew_s:.0f} s",
-            "" if sk_ok else f"El reloj de la máquina que ejecuta la app difiere ~{abs(skew):.0f} s de los servidores; sincronízalo.")
+            "" if sk_ok else f"El reloj de la máquina que ejecuta la app difiere ~{abs(skew):.0f} s de los servidores; "
+            "sincronízalo (un reloj adelantado/atrasado falsea la antigüedad de las velas).")
     else:
         add("clock", "Reloj del dispositivo/servidor", "warn", "sin cabecera Date", "",
             "Los servidores no enviaron hora: no se pudo comprobar (no bloquea).", blocking=False)
@@ -1204,11 +1786,18 @@ def analyze(cfg: Cfg, forced: Optional[str]) -> dict:
             f"({fnum(ctr.reference, 2, '$')}): en 15 min eso es casi imposible, parece un error de escala o de contrato.")
     else:
         add("ref_sane", "Referencia coherente con el precio", "na", blocking=False)
+    if S0 is not None and closed is not None:
+        dv = abs(math.log(S0 / float(closed["close"].iloc[-1])))
+        add("price_vs_candle", "Precio actual vs última vela", "ok" if dv <= 0.01 else "warn", f"{dv * 100:.2f}% de diferencia",
+            "≤ 1%", "El precio en vivo y la última vela cerrada discrepan: posible dato atrasado (no bloquea)."
+            if dv > 0.01 else "", blocking=False)
 
     # ── 7. Coherencia de precios de Kalshi ──
-    q = {k: None for k in PRICE_KEYS}
+    q: Dict[str, Optional[float]] = {k: None for k in PRICE_KEYS}
+    q["yes_ask_size"], q["yes_bid_size"] = None, None
     if mk is not None:
         q = {k: mk[k] for k in PRICE_KEYS}
+        q["yes_ask_size"], q["yes_bid_size"] = mk.get("yes_ask_size"), mk.get("yes_bid_size")
         qs, qd = quote_check(q, cfg.quote_tol)
         add("quote_check", "Precios YES/NO coherentes", qs, f"YES {cents(q['yes_bid'])}/{cents(q['yes_ask'])} · "
             f"NO {cents(q['no_bid'])}/{cents(q['no_ask'])}", f"suma = 100¢ ±{cfg.quote_tol * 100:.0f}¢",
@@ -1222,9 +1811,10 @@ def analyze(cfg: Cfg, forced: Optional[str]) -> dict:
     p_final = p_model_yes = p_nd_yes = None
     unc, why_unc, unc_pts, calibrated, notes_model = "Alta", [], 0, False, []
     platt_used = None
+    alerts: List[Tuple[str, int]] = []
     if (row is not None and ctr is not None and ctr.reference and S0 and tau_min is not None
             and tau_min > 0 and bool(row["valid"])):
-        bt = st.session_state.bt["validated"] if (cfg.use_backtest and st.session_state.bt) else None
+        bt = ss.bt["validated"] if (cfg.use_backtest and ss.bt) else None
         use_drift, platt = True, None
         if bt:
             use_drift = bt["drift_supported"]
@@ -1241,10 +1831,13 @@ def analyze(cfg: Cfg, forced: Optional[str]) -> dict:
         if platt:
             p_final = apply_platt(p_final, *platt)
             platt_used = platt
+        alerts = turn_alerts(f)
+        lean_btc = 1 if mp["p"] >= 0.5 else -1
+        turn_against = sum(1 for _, dr in alerts if dr == -lean_btc)
         spreads = [x - y for x, y in ((q["yes_ask"], q["yes_bid"]), (q["no_ask"], q["no_bid"]))
                    if x is not None and y is not None]
         unc, why_unc, unc_pts = uncertainty(mp["z"], mp["sd"], float(row["sigma_ratio"]),
-                                            min(spreads) if spreads else None, tau_min, calibrated, cfg)
+                                            min(spreads) if spreads else None, tau_min, calibrated, cfg, turn_against)
 
     implied = None
     if q["yes_bid"] is not None and q["yes_ask"] is not None:
@@ -1268,12 +1861,19 @@ def analyze(cfg: Cfg, forced: Optional[str]) -> dict:
         dec = decide(p_final, q, tau_min, cfg, calibrated, problems, unc, "; ".join(why_unc))
     all_filters = F + dec["filters"]
     blockers = [f_ for f_ in all_filters if f_["status"] == "fail" and f_["blocking"]]
+
+    # ── 10. Semáforo de frescura ──
+    conn_err = [f"{n}: {(stat.get(n) or {}).get('error')}" for n in
+                ("Coinbase · precio", "Coinbase · velas 1m", "Kalshi · mercados")
+                if (stat.get(n) or {}).get("ok") is False]
+    fresh_level, fresh_why = freshness(age_of(tick), ta, lag, a_k, conn_err, cfg)
     return {"now": now, "cfg": cfg, "forced": forced, "tick": tick, "cand": cand, "kal": kal, "mk": mk, "ctr": ctr,
             "open_markets": open_markets, "S0": S0, "tau_min": tau_min, "f": f, "closed": closed, "forming": forming,
             "row": row, "n_gap": n_gap, "lag": lag, "mp": mp, "p_final": p_final, "p_model_yes": p_model_yes,
             "p_nd_yes": p_nd_yes, "platt": platt_used, "unc": unc, "why_unc": why_unc, "unc_pts": unc_pts,
             "calibrated": calibrated, "notes_model": notes_model, "q": q, "implied": implied, "dec": dec,
-            "signal": dec["signal"], "filters": all_filters, "blockers": blockers}
+            "signal": dec["signal"], "filters": all_filters, "blockers": blockers, "alerts": alerts,
+            "fresh": {"level": fresh_level, "why": fresh_why}, "data_log": dict(dl)}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1324,24 +1924,43 @@ def reading_rows(R: dict) -> Dict[str, List[Tuple[str, str]]]:
         ind += [(lab.split(" (")[0], f"{float(row[col]):+.2f}") for lab, col, _ in GROUPS]
         ind.append(("Score total (−1…+1)", f"{float(row['score']):+.2f}"))
     times: List[Tuple[str, str]] = [
-        ("Actualizado (local)", loc(R["now"], "%Y-%m-%d %H:%M:%S")), ("Actualizado (UTC)", R["now"].strftime("%H:%M:%S"))]
+        ("Pantalla refrescada (local)", loc(R["now"], "%Y-%m-%d %H:%M:%S")), ("Pantalla refrescada (UTC)", R["now"].strftime("%H:%M:%S"))]
     if tick is not None:
         times += [("Precio descargado", loc(tick["fetched_at"])),
                   ("Última operación Coinbase", loc(tick.get("exchange_time"))),
                   ("Latencia Coinbase precio", fnum(tick.get("latency_ms"), 0, "", " ms"))]
     if R["closed"] is not None:
         last_open = R["closed"]["time"].iloc[-1].to_pydatetime()
-        times.append(("Última vela cerrada (inicio)", loc(last_open)))
+        times += [("Última vela cerrada (inicio)", loc(last_open)), ("Última vela cerrada (cierre)", loc(last_open + timedelta(seconds=60)))]
     if R["kal"] is not None:
         times.append(("Kalshi descargado", loc(R["kal"]["fetched_at"])))
     if mk is not None:
         times += [("Kalshi: updated_time", loc(mk.get("updated"))),
-                  ("Ventana: inicio", loc(ctr.window_start if ctr else None)), ("Ventana: cierre", loc(mk["close_time"]))]
+                  ("Ventana: inicio", loc(ctr.window_start if ctr else None)), ("Ventana: cierre del CONTRATO", loc(mk["close_time"]))]
     return {"probs": probs, "read": read, "ind": ind, "times": times}
 
 
+def sources_rows(R: dict) -> List[List[str]]:
+    cand = R["cand"]
+    if cand is None:
+        return []
+    rows = []
+    for a in cand.get("attempts", []):
+        used = "★ " if a["source"] == cand.get("source") else ""
+        if a["ok"]:
+            rows.append([used + a["source"], "OK", fnum(a["candle_age_s"], 0, "", " s"),
+                         fnum(a["resp_age_s"], 1, "", " s"), fnum(a["age_header"], 0, "", " s") if a["age_header"] is not None else "—",
+                         str(a["cache"] or "—"), fnum(a["latency_ms"], 0, "", " ms")])
+        else:
+            rows.append([used + a["source"], "ERROR", "—", "—", "—", "—", str(a["error"])[:60]])
+    return rows
+
+
+SRC_HDR = ["Fuente", "Estado", "Edad vela", "Edad resp.", "Age hdr", "Caché", "Latencia/Error"]
+
+
 def sides_html(R: dict, cfg: Cfg) -> str:
-    dec, mk = R["dec"], R["mk"]
+    dec = R["dec"]
     S = dec.get("sides") or {}
     if not S:
         return ""
@@ -1355,6 +1974,7 @@ def sides_html(R: dict, cfg: Cfg) -> str:
         ["Prob. modelo"] + [g(k, lambda s: pct(s["p"])) for k in ("UP", "DOWN")],
         ["Compra (ask)"] + [g(k, lambda s: cents(s["ask"])) for k in ("UP", "DOWN")],
         ["Venta (bid)"] + [g(k, lambda s: cents(s["bid"])) for k in ("UP", "DOWN")],
+        ["Contratos al precio"] + [g(k, lambda s: fnum(s["depth"], 0)) for k in ("UP", "DOWN")],
         ["Spread"] + [g(k, lambda s: cents(s["spread"])) for k in ("UP", "DOWN")],
         ["Comisión"] + [g(k, lambda s: f"{s['fee'] * 100:.2f}¢") for k in ("UP", "DOWN")],
         ["Deslizamiento"] + [g(k, lambda s: cents(cfg.slippage)) for k in ("UP", "DOWN")],
@@ -1364,9 +1984,6 @@ def sides_html(R: dict, cfg: Cfg) -> str:
         ["Ventaja neta"] + [g(k, lambda s: f"{s['edge'] * 100:+.1f}¢") for k in ("UP", "DOWN")],
         ["Ventaja exigida", f"{dec['req_edge'] * 100:.1f}¢", f"{dec['req_edge'] * 100:.1f}¢"],
     ]
-    if mk is not None:
-        rows.insert(3, ["Profundidad", fnum(mk.get("yes_ask_size"), 0) if S.get("UP") else "—",
-                        fnum(mk.get("yes_bid_size"), 0) if S.get("DOWN") else "—"])
     hdr = ["", "UP (YES)" + (" ★" if best == "UP" else ""), "DOWN (NO)" + (" ★" if best == "DOWN" else "")]
     return table_html(hdr, rows)
 
@@ -1375,8 +1992,6 @@ def edge_explanation(R: dict, cfg: Cfg) -> str:
     dec = R["dec"]
     if not dec.get("best") or dec.get("req_edge") is None:
         return ""
-    # Se explican AMBOS lados que no alcanzan la ventaja exigida, primero el de mayor probabilidad
-    # (el que normalmente ves como "80-90 %" en pantalla).
     sides = sorted(((k, v) for k, v in dec["sides"].items() if v), key=lambda kv: -kv[1]["p"])
     parts, high = [], False
     for b, s in sides:
@@ -1400,13 +2015,16 @@ def edge_explanation(R: dict, cfg: Cfg) -> str:
 
 def build_diag_text(R: dict, cfg: Cfg) -> str:
     L = [f"DIAGNÓSTICO {loc(R['now'], '%Y-%m-%d %H:%M:%S')} local / {R['now'].strftime('%H:%M:%S')} UTC",
-         f"Señal: {R['signal']}",
+         f"Señal: {R['signal']}  ·  Frescura: {R['fresh']['level']}",
          f"Contrato: {R['ctr'].ticker if R['ctr'] else '—'}  cierre: {loc(R['mk']['close_time']) if R['mk'] else '—'}",
          "", "FILTROS"]
     for f_ in R["filters"]:
         tag = {"ok": "OK   ", "fail": "FALLA", "warn": "AVISO", "na": "N/D  "}[f_["status"]]
         L.append(f"[{tag}] {f_['name']}: {f_['value']}" + (f" | límite {f_['limit']}" if f_["limit"] else "")
                  + (f" | {f_['detail']}" if f_["detail"] and f_["status"] in ("fail", "warn") else ""))
+    sr = sources_rows(R)
+    if sr:
+        L += ["", "FUENTES DE VELAS (" + " | ".join(SRC_HDR) + ")"] + [" | ".join(r) for r in sr]
     rr = reading_rows(R)
     for title, key in (("PROBABILIDADES", "probs"), ("LECTURAS", "read"), ("INDICADORES", "ind"), ("HORAS", "times")):
         L += ["", title] + [f"{k}: {v}" for k, v in rr[key]]
@@ -1426,7 +2044,7 @@ def log_signal(rec: dict) -> None:
     now = utcnow()
     changed = last is None or last.get("señal") != rec["señal"]
     if not changed and rec["señal"] == "ESPERAR" and (last.get("bloqueo") or "") != (rec.get("bloqueo") or ""):
-        changed = True   # sigue en ESPERAR pero cambió el motivo principal
+        changed = True
     heartbeat = False
     if last is not None and rec["señal"] != "ESPERAR":
         try:
@@ -1477,10 +2095,11 @@ def status_panel(now: datetime) -> None:
         age = None if s["ok_at"] is None else (now - s["ok_at"]).total_seconds()
         if s["ok"]:
             rows.append(f"<div class='frow ok'><div class='fh'>{esc(name)} <span class='pill ok'>OK</span></div>"
-                        f"<div class='fm'>{s['latency_ms']:.0f} ms · actualizado {loc(s['ok_at'])}</div></div>")
+                        f"<div class='fm'>{s['latency_ms']:.0f} ms · última respuesta correcta {loc(s['ok_at'])} · "
+                        f"{s.get('n_ok', 0)} descargas</div></div>")
         else:
             extra = (f"último dato bueno ANTIGUO ({age:.0f} s): {loc(s['ok_at'])}" if age is not None else "sin datos previos")
-            rows.append(f"<div class='frow fail'><div class='fh'>{esc(name)} <span class='pill bad'>ERROR</span></div>"
+            rows.append(f"<div class='frow fail'><div class='fh'>{esc(name)} <span class='pill bad'>ERROR ×{s.get('fails', 1)}</span></div>"
                         f"<div class='fm'>{esc(extra)}</div><div class='fd'>{esc(s['error'])}</div></div>")
     st.markdown("".join(rows), unsafe_allow_html=True)
 
@@ -1494,8 +2113,39 @@ def render_header(R: dict, cfg: Cfg) -> None:
         extra = f"  (+{len(R['blockers']) - 1} bloqueo(s) más)" if len(R["blockers"]) > 1 else ""
         st.markdown(f"<div class='why'>⛔ <b>{esc(b['name'])}</b>{esc(extra)}<br>{esc(b['detail'])}</div>",
                     unsafe_allow_html=True)
-    now = R["now"]
-    st.caption(f"Actualizado {loc(now)} ({LOCAL_TZ.key}) · {now.strftime('%H:%M:%S')} UTC · cada {cfg.refresh_s} s")
+
+
+def render_freshness(R: dict, cfg: Cfg) -> None:
+    """Semáforo + datos reales de actualización. 'Pantalla refrescada' ≠ 'datos nuevos del mercado'."""
+    lvl, why = R["fresh"]["level"], R["fresh"]["why"]
+    title = {"green": "Datos frescos", "yellow": "Datos con retraso leve", "red": "Datos obsoletos o sin conexión"}[lvl]
+    st.markdown(f"<div class='fresh {lvl}'><span class='dot {lvl}'></span><span class='t'>{title}</span>"
+                + "".join(f"<div class='fm'>• {esc(w)}</div>" for w in why) + "</div>", unsafe_allow_html=True)
+    now, tick, cand, closed, dl = R["now"], R["tick"], R["cand"], R["closed"], R["data_log"]
+    stt = st.session_state.status
+    last_ok = [s["ok_at"] for s in stt.values() if s.get("ok_at") is not None]
+    cb = [stt.get(n, {}).get("ok_at") for n in ("Coinbase · precio", "Coinbase · velas 1m")]
+    cb_ok = max([x for x in cb if x is not None], default=None)
+    n_err = sum(1 for n in ("Coinbase · precio", "Coinbase · velas 1m", "Kalshi · mercados") if stt.get(n, {}).get("ok") is False)
+    conn = "Todas OK" if (n_err == 0 and len(last_ok) == 3) else f"{n_err} con error" if n_err else "esperando datos"
+    rows: List[Tuple[str, str]] = [("BTC/USD (Coinbase)", "—" if R["S0"] is None else fnum(R["S0"], 2, "$"))]
+    if closed is not None:
+        st_ = closed["time"].iloc[-1].to_pydatetime()
+        rows += [("Última vela cerrada (local)", f"{loc(st_, '%H:%M')} → {loc(st_ + timedelta(seconds=60), '%H:%M')}"),
+                 ("Antigüedad real de esa vela", f"{max(R['lag'], 0):.0f} s (máx. {cfg.candle_max_s} s)")]
+    else:
+        rows += [("Última vela cerrada", "—"), ("Antigüedad real de esa vela", "sin datos")]
+    rows += [("Última respuesta correcta de Coinbase", "—" if cb_ok is None else f"{loc(cb_ok)} (hace {(now - cb_ok).total_seconds():.0f} s)"),
+             ("Fuente de las velas", "—" if cand is None else cand.get("source", "—")),
+             ("Estado de la conexión", conn),
+             ("Pantalla refrescada", f"#{dl['refresh_n']} · {loc(now)} (cada {cfg.refresh_s} s)"),
+             ("Última vela NUEVA recibida", "—" if dl["last_new_candle_at"] is None else
+              f"{loc(dl['last_new_candle_at'])} (hace {(now - dl['last_new_candle_at']).total_seconds():.0f} s)"),
+             ("Último precio distinto recibido", "—" if dl["last_price_change_at"] is None else
+              f"{loc(dl['last_price_change_at'])} (hace {(now - dl['last_price_change_at']).total_seconds():.0f} s)")]
+    st.markdown(kv_html(rows), unsafe_allow_html=True)
+    st.caption(f"Zona horaria: {LOCAL_TZ.key} · {now.strftime('%H:%M:%S')} UTC. Redibujar la pantalla no es recibir datos "
+               "nuevos: mira «Última vela NUEVA recibida».")
 
 
 def render_metrics(R: dict) -> None:
@@ -1521,6 +2171,10 @@ def render_diagnostics(R: dict, cfg: Cfg) -> None:
             st.markdown(f"<div class='note'>{esc(ex)}</div>", unsafe_allow_html=True)
         st.markdown("**Filtros (todos se evalúan a la vez)**")
         st.markdown(filters_html(R["filters"]), unsafe_allow_html=True)
+        sr = sources_rows(R)
+        if sr:
+            st.markdown("**Fuentes de velas** (★ = la usada; «Edad resp.» alta o «Age hdr» > 0 indica copia en caché)")
+            st.markdown(table_html(SRC_HDR, sr), unsafe_allow_html=True)
         rr = reading_rows(R)
         st.markdown("**Probabilidad leída**")
         st.markdown(kv_html(rr["probs"]), unsafe_allow_html=True)
@@ -1534,6 +2188,9 @@ def render_diagnostics(R: dict, cfg: Cfg) -> None:
         if rr["ind"]:
             st.markdown("**Indicadores calculados** (última vela cerrada)")
             st.markdown(kv_html(rr["ind"]), unsafe_allow_html=True)
+        if R["alerts"]:
+            st.markdown("**Posibles cambios de dirección / volatilidad**")
+            st.markdown("".join(f"<div class='fm'>• {esc(t)}</div>" for t, _ in R["alerts"]), unsafe_allow_html=True)
         if R["why_unc"]:
             st.markdown(f"**Incertidumbre: {R['unc']}** ({R['unc_pts']} pts · 'Alta' desde 4)")
             st.markdown("".join(f"<div class='fm'>• {esc(w)}</div>" for w in R["why_unc"]), unsafe_allow_html=True)
@@ -1576,6 +2233,11 @@ def render_explanation(R: dict, cfg: Cfg) -> None:
         gap = S0 - ctr.reference
         (pro if np.sign(gap) == dir_btc else con).append(
             f"Precio vs referencia: {gap:+,.2f} USD ({mp['dist'] * 1e4:+.1f} pb; z = {mp['z']:+.2f})")
+        for t, dr in R["alerts"]:
+            if dr == -dir_btc:
+                con.append("Posible giro: " + t)
+            elif dr == dir_btc:
+                pro.append("Refuerzo: " + t)
         st.markdown("**A favor**")
         st.write("\n".join(f"- {t}" for t in pro) or "- (ninguno destacable)")
         st.markdown("**En contra**")
@@ -1589,6 +2251,7 @@ def render_explanation(R: dict, cfg: Cfg) -> None:
             st.caption(f"Comisión de ejemplo para 10 contratos a {cents(ask_ref)}: "
                        f"${kalshi_fee_order(10, ask_ref, cfg.fee_rate):.2f} (se redondea al centavo por orden). "
                        f"Incluye deslizamiento supuesto de {cfg.slippage * 100:.0f}¢.")
+        st.caption("Estimación estadística, no una certeza: ninguna señal garantiza ganancias.")
 
 
 def render_chart(R: dict, cfg: Cfg) -> None:
@@ -1607,7 +2270,7 @@ def render_contract(R: dict) -> None:
     with st.expander("Datos y reglas del contrato de Kalshi"):
         st.markdown(kv_html([
             ("Ticker", ctr.ticker), ("Título", ctr.title), ("Estado (Kalshi)", mk.get("status")),
-            ("Inicio de ventana", loc(ctr.window_start)), ("Cierre", loc(ctr.close_time)),
+            ("Inicio de ventana", loc(ctr.window_start)), ("Cierre del contrato", loc(ctr.close_time)),
             ("Referencia", fnum(ctr.reference, 2, "$")), ("Tipo de referencia", ctr.reference_kind),
             ("YES gana si precio ≥ referencia", "sí" if ctr.yes_if_above else "no (invertido)"),
             ("Volumen", fnum(mk["volume"], 0)), ("Interés abierto", fnum(mk["open_interest"], 0)),
@@ -1627,11 +2290,15 @@ def record_wait(R: dict) -> None:
         ss.wait_counts[b["id"]] = ss.wait_counts.get(b["id"], 0) + 1
 
 
-def render_live(cfg: Cfg, forced: Optional[str]) -> None:
+def render_live(cfg: Cfg, forced: Optional[str], tcfg: Optional[TradeCfg] = None) -> None:
+    tcfg = tcfg or TradeCfg()
     R = analyze(cfg, forced)
     record_wait(R)
+    auto_trade(R, cfg, tcfg)
     render_header(R, cfg)
+    render_freshness(R, cfg)
     render_metrics(R)
+    render_trading(R, cfg, tcfg)
     render_diagnostics(R, cfg)
     render_explanation(R, cfg)
     render_chart(R, cfg)
@@ -1650,6 +2317,8 @@ def render_live(cfg: Cfg, forced: Optional[str]) -> None:
                     "bloqueo": "+".join(b["id"] for b in R["blockers"]) if R["signal"] == "ESPERAR" else "",
                     "cierre_utc": ctr.close_time.strftime("%Y-%m-%d %H:%M:%S"), "resultado": None, "acierto": None})
     resolve_history(now)
+    if tcfg.mode == "live":
+        resolve_trades(now)
     render_history()
 
 
@@ -1741,52 +2410,252 @@ def render_backtest(cfg: Cfg) -> None:
     st.caption("Con muestras pequeñas el ruido es grande. Las decisiones de una misma ventana están correlacionadas.")
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# AUTO-PRUEBAS (datos SINTÉTICOS: solo para comprobar la lógica; la app nunca los usa)
+# ──────────────────────────────────────────────────────────────────────────────
+def _synth_raw(n: int, end_start: datetime, seed: int = 7, price0: float = 100_000.0) -> List[List[float]]:
+    """n velas sintéticas, la última con inicio = end_start. Formato Coinbase (más reciente primero)."""
+    rng = np.random.default_rng(seed)
+    rets = rng.normal(0, 4e-4, n)
+    closes = price0 * np.exp(np.cumsum(rets))
+    rows = []
+    for i in range(n):
+        t = end_start - timedelta(minutes=(n - 1 - i))
+        o = closes[i - 1] if i else price0
+        c = closes[i]
+        hi, lo = max(o, c) * 1.0002, min(o, c) * 0.9998
+        rows.append([float(int(t.timestamp())), lo, hi, o, c, float(rng.uniform(1, 5))])
+    return rows[::-1]
+
+
+def selftest() -> List[Tuple[str, bool, str]]:
+    T: List[Tuple[str, bool, str]] = []
+
+    def chk(name: str, cond: bool, detail: str = "") -> None:
+        T.append((name, bool(cond), detail))
+
+    now = datetime(2026, 10, 23, 12, 0, 30, tzinfo=timezone.utc)
+    cfg = Cfg()
+
+    # 1) parse_candles: inválidas, duplicadas, desalineadas, futuras, desordenadas
+    base = int(datetime(2026, 10, 23, 11, 57, tzinfo=timezone.utc).timestamp())
+    raw = [[base + 120, 99, 101, 100, 100.5, 1], [base, 99, 101, 100, 100.5, 1], [base + 60, 99, 101, 100, 100.2, 1],
+           [base + 60, 99, 101, 100, 100.3, 1],                   # duplicada
+           [base + 90, 99, 101, 100, 100.5, 1],                   # desalineada
+           [base + 180, 99, 101, 100, 100.5, 1],                  # 12:00:00 → válida y en curso
+           [base + 600, 99, 101, 100, 100.5, 1],                  # futura
+           [base + 240, 105, 101, 100, 100.5, 1]]                 # OHLC inválido (low > high)
+    df, rep = parse_candles(raw, now)
+    chk("parse: descarta inválidas/desalineadas/futuras/duplicadas",
+        rep["invalidas"] == 1 and rep["desalineadas"] == 1 and rep["futuras"] == 1 and rep["duplicadas"] == 1,
+        str(rep))
+    chk("parse: orden cronológico y sin duplicados", df["time"].is_monotonic_increasing and df["time"].is_unique)
+    chk("parse: detecta lista desordenada", rep["desordenadas"])
+    chk("parse: timestamps en UTC", str(df["time"].dt.tz) == "UTC")
+
+    # 2) velas cerradas vs en formación y antigüedad
+    closed, forming = split_closed(df, now)
+    chk("cerradas: la vela de las 12:00:00 sigue formándose a las 12:00:30",
+        len(forming) == 1 and forming["time"].iloc[0] == pd.Timestamp("2026-10-23 12:00:00", tz="UTC"))
+    chk("cerradas: última cerrada = 11:59 y antigüedad 30 s",
+        closed["time"].iloc[-1] == pd.Timestamp("2026-10-23 11:59:00", tz="UTC") and abs(candle_age_s(closed, now) - 30) < 1e-6,
+        f"edad={candle_age_s(closed, now)}")
+    chk("cerradas: sin datos → antigüedad infinita", candle_age_s(closed.iloc[0:0], now) == float("inf"))
+
+    # 3) retraso detectado (simula una fuente atrasada 5 min)
+    stale = parse_candles(_synth_raw(120, now.replace(second=0) - timedelta(minutes=6)), now)[0]
+    age_stale = candle_age_s(split_closed(stale, now)[0], now)
+    chk("retraso: una fuente atrasada supera el límite y se marca ROJO",
+        age_stale > cfg.candle_max_s and freshness(1, 1, age_stale, 1, [], cfg)[0] == "red", f"edad={age_stale:.0f}s")
+
+    # 4) huecos: internos se rellenan, el final NUNCA
+    g = pd.DataFrame({"time": pd.to_datetime(["2026-10-23 11:50", "2026-10-23 11:52", "2026-10-23 11:53"], utc=True),
+                      "open": [1, 1, 1], "high": [2, 2, 2], "low": [1, 1, 1], "close": [1.5, 1.5, 1.5], "volume": [1, 1, 1]})
+    gf, nmiss = fill_gaps(g)
+    chk("huecos: relleno interno de 1 min y gap_stats coincide", nmiss == 1 and len(gf) == 4 and gap_stats(g) == (1, 1))
+    chk("huecos: nunca se extiende hacia el presente", gf["time"].iloc[-1] == g["time"].iloc[-1])
+
+    # 5) fuente de respaldo: conversión del formato
+    conv = _advanced_to_raw({"candles": [{"start": "1700000040", "low": "1", "high": "3", "open": "2", "close": "2.5", "volume": "4"}]})
+    chk("respaldo: conversión Advanced → formato Exchange", conv == [[1700000040.0, 1.0, 3.0, 2.0, 2.5, 4.0]])
+    try:
+        _advanced_to_raw({"candles": []}); ok = False
+    except RuntimeError:
+        ok = True
+    chk("respaldo: respuesta vacía lanza error (no se inventan velas)", ok)
+
+    # 6) indicadores causales: añadir velas futuras no cambia los valores pasados
+    big = parse_candles(_synth_raw(260, now.replace(second=0) - timedelta(minutes=1)), now)[0]
+    f_full, f_cut = compute_features(big), compute_features(big.iloc[:200])
+    cols = ["ema9", "ema21", "ema50", "rsi", "macd", "macd_hist", "atr", "sigma", "score"]
+    chk("indicadores: causales (sin mirar el futuro)",
+        all(np.allclose(f_full[c].iloc[199], f_cut[c].iloc[199], equal_nan=True) for c in cols))
+    chk("indicadores: válidos tras el calentamiento", bool(f_full["valid"].iloc[-1]) and not f_full["valid"].iloc[10])
+
+    # 7) Kalshi: precios derivados y coherencia
+    m = parse_market({"ticker": "KXBTC15M-TEST", "yes_bid_dollars": "0.40", "no_bid_dollars": "0.55",
+                      "floor_strike": 100000, "strike_type": "greater_or_equal",
+                      "close_time": "2026-10-23T12:15:00Z", "yes_ask_size_fp": "120.00"})
+    chk("kalshi: ask derivado = 1 − bid contrario", abs(m["yes_ask"] - 0.45) < 1e-9 and abs(m["no_ask"] - 0.60) < 1e-9
+        and set(m["derived"]) == {"yes_ask", "no_ask"})
+    chk("kalshi: precios coherentes aceptados / incoherentes rechazados",
+        quote_check(m, 0.02)[0] == "ok" and quote_check({"yes_ask": 0.5, "no_bid": 0.2, "yes_bid": None, "no_ask": None}, 0.02)[0] == "fail")
+
+    # 8) comisión y decisión
+    chk("comisión taker: 0.07·0.5·0.5 = 1.75¢ y orden redondeada al centavo",
+        abs(kalshi_fee(0.5, 0.07) - 0.0175) < 1e-12 and abs(kalshi_fee_order(10, 0.5, 0.07) - 0.18) < 1e-9)
+    q_hi = {"yes_ask": 0.92, "yes_bid": 0.90, "no_ask": 0.10, "no_bid": 0.08, "yes_ask_size": 200, "yes_bid_size": 200}
+    d1 = decide(0.90, q_hi, 5, cfg, True, [], "Baja")
+    chk("decisión: 90 % de probabilidad a 92¢ NO es ventaja → ESPERAR", d1["signal"] == "ESPERAR")
+    q_ok = {"yes_ask": 0.60, "yes_bid": 0.58, "no_ask": 0.42, "no_bid": 0.40, "yes_ask_size": 200, "yes_bid_size": 200}
+    d2 = decide(0.80, q_ok, 5, cfg, True, [], "Baja")
+    chk("decisión: 80 % a 60¢ con filtros OK → BUY UP (sin esperar al 80–90 % del mercado)", d2["signal"] == "BUY UP")
+    d3 = decide(0.80, q_ok, 5, cfg, True, ["Velas atrasadas"], "Baja")
+    chk("decisión: datos obsoletos bloquean la señal aunque haya ventaja", d3["signal"] == "ESPERAR")
+    d4 = decide(0.80, dict(q_ok, yes_ask_size=1), 5, cfg, True, [], "Baja")
+    chk("decisión: poca liquidez bloquea", d4["signal"] == "ESPERAR" and any(f["id"] == "depth" and f["status"] == "fail" for f in d4["filters"]))
+    d5 = decide(0.20, q_ok, 5, cfg, True, [], "Baja")
+    chk("decisión: probabilidad baja de YES con NO barato → BUY DOWN", d5["signal"] == "BUY DOWN")
+
+    # 9) modelo
+    p_far = model_prob(100_300, 100_000, 5, 4e-4, 0.0, cfg)["p"]
+    p_near = model_prob(100_010, 100_000, 5, 4e-4, 0.0, cfg)["p"]
+    chk("modelo: más lejos sobre el umbral → más probabilidad de YES", p_far > p_near > 0.5)
+
+    # 10) semáforo
+    chk("semáforo: verde / amarillo / rojo",
+        freshness(2, 3, 30, 2, [], cfg)[0] == "green" and freshness(2, 3, 100, 2, [], cfg)[0] == "yellow"
+        and freshness(2, 3, 200, 2, [], cfg)[0] == "red" and freshness(None, 3, 30, 2, [], cfg)[0] == "red")
+
+    # 11) operación: cuerpo de la orden, guardas y firma
+    chk("orden: BUY UP → yes + precio YES en dólares + fill_or_kill",
+        build_order_body("KXBTC15M-X1", "UP", 2, 0.57, "b-X")
+        == {"ticker": "KXBTC15M-X1", "side": "yes", "action": "buy", "client_order_id": "b-X", "count": 2,
+            "count_fp": "2.00", "yes_price_dollars": "0.5700", "time_in_force": "fill_or_kill"})
+    bd = build_order_body("T", "DOWN", 1, 0.43, "b-T")
+    chk("orden: BUY DOWN → no + precio NO", bd["side"] == "no" and bd["no_price_dollars"] == "0.4300" and "yes_price_dollars" not in bd)
+    chk("orden: client_order_id solo [A-Za-z0-9-]", re.fullmatch(r"[A-Za-z0-9-]+", client_order_id_for("KXBTC15M-26OCT231215-15_x")) is not None)
+    chk("orden: precio límite redondea hacia arriba al centavo y tope 0.99", ceil_cent(0.917) == 0.92 and ceil_cent(0.60) == 0.60 and ceil_cent(0.995) == 0.99)
+    ctr_ = type("C", (), {"ticker": "KXBTC15M-T1"})()
+    Rg = {"signal": d2["signal"], "dec": d2, "fresh": {"level": "green"}, "ctr": ctr_}
+    nowg = datetime(2026, 10, 23, 12, 0, 30, tzinfo=timezone.utc)
+    tc = TradeCfg(mode="live", contracts=1)
+    w0, plan0 = trade_guard(Rg, cfg, tc, [], nowg, 2, None)
+    chk("guarda: todo en regla → se puede enviar", w0 == [] and plan0["side"] == "UP", str(w0))
+    chk("guarda: semáforo no verde bloquea", trade_guard(dict(Rg, fresh={"level": "yellow"}), cfg, tc, [], nowg, 2, None)[0] != [])
+    chk("guarda: señal no confirmada (1 lectura) bloquea", trade_guard(Rg, cfg, tc, [], nowg, 1, None)[0] != [])
+    chk("guarda: una sola orden por contrato", trade_guard(Rg, cfg, tc, [{"ticker": "KXBTC15M-T1", "modo": "live"}], nowg, 2, None)[0] != [])
+    chk("guarda: simulación previa no bloquea el modo real", trade_guard(Rg, cfg, tc, [{"ticker": "KXBTC15M-T1", "modo": "dry"}], nowg, 2, None)[0] == [])
+    chk("guarda: tope por operación", trade_guard(Rg, cfg, TradeCfg(mode="live", contracts=20, max_cost=5.0), [], nowg, 2, None)[0] != [])
+    lossy = [{"ticker": "A", "modo": "live", "ts_utc": "2026-10-23 10:00:00", "cierre_utc": "2026-10-23 10:15:00", "pnl": "-11", "fill": "1", "resultado": "no"}]
+    chk("guarda: pérdida diaria máxima detiene", trade_guard(Rg, cfg, tc, lossy, nowg, 2, None)[0] != [])
+    chk("guarda: operación detenida bloquea", trade_guard(Rg, cfg, tc, [], nowg, 2, "duda")[0] != [])
+    chk("guarda: poca liquidez bloquea", trade_guard(dict(Rg, dec=d4), cfg, tc, [], nowg, 2, None)[0] != [])
+    chk("guarda: sin señal BUY no opera", trade_guard(dict(Rg, signal="ESPERAR"), cfg, tc, [], nowg, 9, None)[0] != [])
+    try:
+        from cryptography.hazmat.primitives.asymmetric import rsa, padding
+        from cryptography.hazmat.primitives import hashes, serialization
+        k = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        pem = k.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption())
+        sig = base64.b64decode(kalshi_sign("POST", "/trade-api/v2/portfolio/orders", "1700000000000", pem))
+        k.public_key().verify(sig, b"1700000000000POST/trade-api/v2/portfolio/orders",
+                              padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH), hashes.SHA256())
+        chk("firma RSA-PSS verificable con la clave pública (ts+MÉTODO+ruta)", True)
+    except ImportError:
+        chk("firma RSA-PSS (omitida: falta 'cryptography' en este equipo)", True)
+    except Exception as e:  # noqa: BLE001
+        chk("firma RSA-PSS verificable", False, str(e))
+    return T
+
+
+def render_selftest() -> None:
+    res = selftest()
+    ok = sum(1 for _, c, _ in res if c)
+    (st.success if ok == len(res) else st.error)(f"{ok}/{len(res)} pruebas superadas (datos sintéticos, sin internet).")
+    st.markdown("".join(f"<div class='frow {'ok' if c else 'fail'}'><div class='fh'>{'✅' if c else '⛔'} {esc(n)}</div>"
+                        + (f"<div class='fd'>{esc(d)}</div>" if d and not c else "") + "</div>" for n, c, d in res),
+                unsafe_allow_html=True)
+
+
+def live_check() -> None:
+    """Consulta real (requiere internet). Imprime la antigüedad de la última vela cerrada por fuente y las
+    cabeceras de caché: así se identifica de dónde viene el retraso en TU red."""
+    print(f"Hora local del equipo (UTC): {utcnow():%Y-%m-%d %H:%M:%S}")
+    for name, fn in CANDLE_SOURCES:
+        try:
+            t0 = utcnow()
+            j, lat, sdt, meta = fn(t0)
+            t1 = utcnow()
+            df, rep = parse_candles(j, t1)
+            closed, forming = split_closed(df, t1)
+            print(f"\n[{name}] {lat:.0f} ms · intentos={meta['attempts']}")
+            print(f"  última vela cerrada (inicio UTC): {closed['time'].iloc[-1]}  → antigüedad {candle_age_s(closed, t1):.0f} s")
+            print(f"  vela en formación: {'sí' if len(forming) else 'no'} · filas={rep['filas']} · reporte={rep}")
+            print(f"  cabecera Date: {sdt} (edad de la respuesta {(t1 - sdt).total_seconds():.1f} s)" if sdt else "  sin cabecera Date")
+            print(f"  cabecera Age: {meta['age']} · caché: {meta['cache']}")
+            print(f"  huecos (total, últimos 10): {gap_stats(closed)}")
+        except Exception as e:  # noqa: BLE001
+            print(f"\n[{name}] ERROR: {e}")
+    try:
+        tk = fetch_ticker()
+        print(f"\n[Ticker] {tk['price']:,.2f} · última operación {tk['exchange_time']} · {tk['latency_ms']:.0f} ms")
+    except Exception as e:  # noqa: BLE001
+        print(f"\n[Ticker] ERROR: {e}")
+    try:
+        k = fetch_kalshi_markets()
+        print(f"[Kalshi] {len(k['markets'])} contratos abiertos · {k['latency_ms']:.0f} ms")
+    except Exception as e:  # noqa: BLE001
+        print(f"[Kalshi] ERROR: {e}")
+
+
 def render_help() -> None:
     st.markdown("""
 ### Cómo interpretar la señal
-* **BUY UP** — El modelo da a YES más probabilidad que su precio de compra + comisión + deslizamiento, con al menos
-  la ventaja mínima configurada y **todos** los filtros en verde.
-* **BUY DOWN** — Lo mismo para el lado NO.
-* **ESPERAR** — Algún filtro bloqueante falló. Abre **🔎 Diagnóstico** para ver cuál, con el valor leído y su límite.
+* **BUY UP / BUY DOWN** — El modelo estima una probabilidad mayor que el costo de equilibrio del lado (precio de compra +
+  comisión + deslizamiento) más la ventaja mínima, y **todos** los filtros bloqueantes están en verde.
+* **ESPERAR** — Falta algún dato fresco, hay contradicciones o la ventaja neta no alcanza. Abre **🔎 Diagnóstico**.
+* Es una **estimación estadística**: nunca una certeza ni una garantía de ganancia.
 
-### Una probabilidad alta NO es una señal
-Si el modelo da 85 % y Kalshi vende ese lado a 86¢, comprarlo no tiene ventaja: pagas 86¢ + comisión + deslizamiento por
-algo que vale 85¢. Para señal hace falta que la probabilidad supere el **costo de equilibrio + la ventaja exigida**
-(la tabla de costos del diagnóstico muestra esa "probabilidad mínima"). Con precios de 80–90¢ y 6¢ de margen, la
-probabilidad requerida suele rondar 88–98 %. Los filtros no se desactivan solos ni se relajan automáticamente.
+### Semáforo de frescura
+* 🟢 Todo dentro de límites · 🟡 retraso leve o un intento fallido (se usa el dato anterior, con su edad real) ·
+  🔴 alguna fuente crítica obsoleta o sin respuesta → las señales se bloquean.
+* **Pantalla refrescada** (cada N s) ≠ **datos nuevos**: la app solo descarga de nuevo cuando pasó el intervalo mínimo
+  de cada fuente, y la antigüedad siempre se cuenta desde la descarga original, nunca desde el redibujado.
 
-### Qué hace cada filtro bloqueante
-Datos frescos (precio, última operación, velas, Kalshi, reloj) · contrato correcto y reglas soportadas · referencia
-coherente · precios YES/NO coherentes · tiempo restante · ventaja neta · rango de entrada · spread · incertidumbre.
+### Sobre el retraso de las velas
+La causa más probable está en la consulta, no en la pantalla: la versión anterior pedía las velas **sin `start`/`end`**
+(una URL idéntica para todos, susceptible de copias en caché) y además guardaba la respuesta en `st.cache_data`.
+Esta versión pide ventanas explícitas, envía `Cache-Control: no-cache`, mide la edad real de cada respuesta
+(`Date`/`Age`), consulta una fuente de respaldo cuando la principal se atrasa y **bloquea** si ninguna entrega datos
+recientes. No fabrica velas: los huecos al final se muestran como retraso. Ejecuta `python app.py --live-check` en tu red
+para ver el retraso real de cada fuente.
 
-### Qué pasaría si se relajaran (por eso no se tocan por defecto)
-* **Ventaja mínima / margen por no calibrado:** bajarlos genera más señales, pero con ventajas que la comisión y el
-  deslizamiento pueden borrar; en muestras pequeñas el modelo puede estar sobreconfiado.
-* **Spread máximo:** subirlo te hace pagar más por entrar y salir.
-* **Incertidumbre 'Alta':** se activa con varios factores a la vez (modelo sin validar, cerca del umbral, spread
-  ancho, menos de 2 min, error Coinbase↔BRTI comparable al movimiento). Ignorarla es operar justo cuando el modelo
-  es menos fiable.
-* **Frescura de datos:** subir el límite deja operar con precios viejos.
+### Operación automática (opcional)
+Modos: **Apagado**, **Simulación** (registra lo que haría, no envía nada) y **REAL**. REAL exige `KALSHI_LIVE_OK=1`,
+escribir OPERAR, semáforo verde, la misma señal en varias lecturas, una sola orden por contrato, tope por orden,
+límite diario de operaciones, pérdida diaria máxima y exposición máxima. Las órdenes son límite *fill-or-kill*.
+Si una orden queda en duda (timeout o error 5xx) todo se detiene hasta que revises tu cuenta. Empieza siempre en
+Simulación y luego con 1 contrato. Una señal no es una garantía.
 
-### CAMBIOS de esta versión
-1. **Todos los filtros se evalúan siempre**: antes el primero que fallaba ocultaba el resto del diagnóstico.
-2. **La vela en formación ya no bloquea**: Coinbase la omite los primeros segundos de cada minuto y solo se usaba para dibujar.
-3. **Reloj**: ahora se mide con la hora de descarga (antes se comparaba con respuestas en caché, lo que podía dar falsos desfases).
-4. **Nuevos filtros de seguridad**: antigüedad de la última operación de Coinbase, referencia coherente con el precio
-   (error de escala/contrato), coherencia de los 4 precios YES/NO, y contrato elegido = contrato analizado.
-5. **Precios con décimas de centavo** (Kalshi cotiza 91.7¢ sobre 90¢): ya no se redondean a ciegas.
-6. Zona horaria por defecto: America/Chicago. Gráfica estática y columnas lado a lado para celular.
+### Qué se bloquea
+Datos frescos (precio, última operación, velas, huecos, Kalshi, reloj) · contrato correcto y reglas soportadas ·
+referencia coherente · precios YES/NO coherentes · tiempo restante · ventaja neta · rango de entrada · spread ·
+liquidez · incertidumbre. Los filtros no se relajan solos.
 
 ### Limitaciones importantes
 * Kalshi liquida con **CF Benchmarks BRTI** (promedio de ~60 s). Este analizador usa **Coinbase** como aproximación.
 * La comisión usa la fórmula general taker `0.07·P·(1−P)` (configurable). Verifica la tabla vigente de Kalshi.
-* Los precios YES/NO vienen de la API pública de mercados; la profundidad a ese precio puede ser pequeña.
-* El score de tendencia/momentum es heurístico. Hasta que el backtest lo respalde, la probabilidad se marca como
-  **no calibrada** y se exige un margen extra.
-* Mercados de 15 minutos son muy eficientes y las comisiones consumen gran parte de cualquier ventaja pequeña.
-  **No hay señales infalibles. Esto no es asesoría financiera. Puedes perder todo lo que operes.**
-* Este programa **nunca envía órdenes**. No requiere ni guarda claves.
+* El score de tendencia/momentum es heurístico; hasta que el backtest lo respalde, la probabilidad se marca **no calibrada**.
+* Los mercados de 15 minutos son muy eficientes y las comisiones consumen gran parte de cualquier ventaja pequeña.
+  **Esto no es asesoría financiera. Puedes perder todo lo que operes.**
+* Por defecto este programa **no envía órdenes** y no usa claves. La operación automática es opcional, está apagada
+  y nunca guarda claves en el código ni en disco (solo variables de entorno).
 """)
+    st.markdown("#### Pruebas de diagnóstico")
+    st.caption("Comprueban la lógica (timestamps, velas cerradas, huecos, caché, decisión) con datos SINTÉTICOS. "
+               "No prueban tu conexión: para eso usa `python app.py --live-check`.")
+    if st.button("Ejecutar pruebas"):
+        render_selftest()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1798,7 +2667,7 @@ def main() -> None:
     st.markdown(CSS, unsafe_allow_html=True)
     init_state()
     st.markdown("### 🟣 Kalshi · BTC 15 min")
-    st.caption("Solo análisis: no opera por ti. Ajustes: botón » arriba a la izquierda.")
+    st.caption("Solo BTC/USD · la operación automática está APAGADA por defecto. Ajustes: botón » arriba a la izquierda.")
 
     global LOCAL_TZ
     with st.sidebar:
@@ -1806,27 +2675,30 @@ def main() -> None:
         tzname = st.selectbox("Zona horaria", TZ_CHOICES,
                               index=TZ_CHOICES.index(DEFAULT_TZ) if DEFAULT_TZ in TZ_CHOICES else 0)
         LOCAL_TZ = ZoneInfo(tzname)
-        refresh = st.slider("Actualizar cada (s)", 5, 30, 8)
+        refresh = st.slider("Redibujar pantalla cada (s)", 5, 30, 6)
         forced = None
-        try:
-            mk = fetch_kalshi_markets()["markets"]
-            tickers = [m["ticker"] for m in sorted(mk, key=lambda m: m["close_time"] or utcnow()) if m.get("ticker")]
+        kal_side, _ = safe_fetch("Kalshi · mercados", fetch_kalshi_markets, 4)
+        if kal_side is not None:
+            tickers = [m["ticker"] for m in sorted(kal_side["markets"], key=lambda m: m["close_time"] or utcnow()) if m.get("ticker")]
             choice = st.selectbox("Contrato", ["Automático (el que está corriendo)"] + tickers)
             forced = None if choice.startswith("Automático") else choice
-        except Exception:
+        else:
             st.caption("No se pudo listar contratos de Kalshi ahora mismo.")
         with st.expander("Umbrales de la señal", expanded=False):
             min_edge = st.slider("Ventaja neta mínima (¢)", 1.0, 15.0, 4.0, 0.5)
             extra = st.slider("Margen extra si no está calibrado (¢)", 0.0, 10.0, 2.0, 0.5)
             max_spread = st.slider("Spread máximo (¢)", 1, 20, 8)
+            min_depth = st.slider("Contratos mínimos al precio de entrada", 1, 100, 5)
             slip = st.slider("Deslizamiento supuesto (¢)", 0.0, 5.0, 1.0, 0.5)
             fee_rate = st.number_input("Tasa de comisión taker", 0.0, 0.2, 0.07, 0.005, format="%.3f")
             min_tau = st.slider("Segundos mínimos restantes", 15, 180, 45)
         with st.expander("Frescura de datos", expanded=False):
             max_age = st.slider("Antigüedad máxima de precio/Kalshi (s)", 10, 60, 20)
             max_trade = st.slider("Antigüedad máxima de la última operación (s)", 20, 180, 60)
-            st.caption("Subirlos permite señales con datos más viejos. Si tu conexión es lenta, súbelos poco a poco "
-                       "y vigila la hora de actualización en el diagnóstico.")
+            c_warn = st.slider("Vela cerrada: aviso amarillo desde (s)", 60, 150, 75)
+            c_max = st.slider("Vela cerrada: bloqueo desde (s)", 90, 300, 150)
+            st.caption("Una vela de 1 min recién cerrada tiene entre 0 y ~60 s de antigüedad. Subir estos límites "
+                       "permite señales con datos más viejos: hazlo solo si entiendes el riesgo.")
         with st.expander("Modelo", expanded=False):
             basis = st.slider("Error Coinbase↔BRTI (puntos base)", 0.0, 6.0, 1.5, 0.5)
             drift = st.slider("Peso máximo del score (σ)", 0.0, 0.6, 0.25, 0.05)
@@ -1834,17 +2706,35 @@ def main() -> None:
             use_bt = st.checkbox("Aplicar resultados del último backtest", True)
         chart_n = st.slider("Velas en la gráfica", 30, 240, 60, 10)
         st.divider()
-        st.caption("Sin claves de API: se usan solo endpoints públicos. Nada se compra automáticamente.")
+        with st.expander("🤖 Operación automática", expanded=False):
+            st.caption("Apagada por defecto. Claves solo por variables de entorno (KALSHI_API_KEY_ID, "
+                       "KALSHI_PRIVATE_KEY_PATH). Empieza en Simulación.")
+            mode_l = st.radio("Modo", ["Apagado", "Simulación (no envía nada)", "REAL (envía órdenes)"], index=0)
+            mode = {"Apagado": "off", "Simulación (no envía nada)": "dry", "REAL (envía órdenes)": "live"}[mode_l]
+            t_contracts = st.slider("Contratos por orden", 1, 20, 1)
+            t_max_cost = st.number_input("Tope por operación ($)", 0.5, 100.0, 5.0, 0.5)
+            t_max_trades = st.slider("Operaciones reales máx. por día", 1, 20, 5)
+            t_max_loss = st.number_input("Pérdida diaria máxima ($)", 1.0, 500.0, 10.0, 1.0)
+            t_max_exp = st.number_input("Exposición máxima sin resolver ($)", 1.0, 500.0, 10.0, 1.0)
+            t_confirm = st.slider("Lecturas seguidas con la misma señal", 1, 5, 2)
+            unlocked = False
+            if mode == "live":
+                st.warning("REAL envía órdenes con dinero de verdad. Requiere KALSHI_LIVE_OK=1 en el entorno.")
+                typed = st.text_input("Escribe OPERAR para confirmar")
+                unlocked = (os.getenv("KALSHI_LIVE_OK") == "1") and typed.strip() == "OPERAR"
+        tcfg = TradeCfg(mode=mode, contracts=t_contracts, max_cost=t_max_cost, max_trades_day=t_max_trades,
+                        max_daily_loss=t_max_loss, max_exposure=t_max_exp, confirm_reads=t_confirm, live_unlocked=unlocked)
+        st.caption("Datos públicos sin claves. Las claves solo se usan si activas la operación automática.")
 
     cfg = Cfg(refresh_s=refresh, min_edge=min_edge / 100, uncal_extra=extra / 100, max_spread=max_spread / 100,
-              fee_rate=fee_rate, slippage=slip / 100, min_tau_min=min_tau / 60, basis_bps=basis, drift_cap=drift,
-              sigma_inflate=infl, chart_minutes=chart_n, use_backtest=use_bt, max_age_s=max_age,
-              max_trade_age_s=max_trade)
+              min_depth=float(min_depth), fee_rate=fee_rate, slippage=slip / 100, min_tau_min=min_tau / 60,
+              basis_bps=basis, drift_cap=drift, sigma_inflate=infl, chart_minutes=chart_n, use_backtest=use_bt,
+              max_age_s=max_age, max_trade_age_s=max_trade, candle_warn_s=min(c_warn, c_max), candle_max_s=c_max)
 
     t_live, t_bt, t_help = st.tabs(["Señal", "Backtest", "Ayuda"])
     with t_live:
         live = st.fragment(run_every=cfg.refresh_s)(render_live)
-        live(cfg, forced)
+        live(cfg, forced, tcfg)
     with t_bt:
         render_backtest(cfg)
     with t_help:
@@ -1852,4 +2742,14 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    if "--selftest" in sys.argv:
+        _res = selftest()
+        for _n, _c, _d in _res:
+            print(("PASS " if _c else "FAIL ") + _n + (f"  [{_d}]" if (_d and not _c) else ""))
+        print(f"\n{sum(1 for _, c, _ in _res if c)}/{len(_res)} pruebas superadas (datos sintéticos)")
+        sys.exit(0 if all(c for _, c, _ in _res) else 1)
+    elif "--live-check" in sys.argv:
+        live_check()
+        sys.exit(0)
+    else:
+        main()
