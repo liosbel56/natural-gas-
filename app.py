@@ -8,6 +8,10 @@ Kalshi Signal Bot — SOLO BTC/USD · contratos KXBTC15M (15 minutos)
 * Precio/velas: Coinbase (Exchange API; respaldo: API pública de Advanced Trade). Contrato: Kalshi (público).
 * Los resultados pasados NO garantizan resultados futuros. Esto no es asesoría financiera.
 
+NOVEDADES de esta versión:
+  - Muestra la INCLINACIÓN (UP/DOWN) y cuántos ¢ de ventaja FALTAN cuando la señal es ESPERAR.
+  - Perfiles de sensibilidad (Conservador / Equilibrado / Sensible) en la barra lateral.
+
 Instalar:        pip install "streamlit>=1.37" pandas numpy requests plotly cryptography
 Ejecutar:        streamlit run app.py
 Auto-pruebas:    python app.py --selftest        (datos SINTÉTICOS, no necesita internet)
@@ -58,7 +62,7 @@ TZ_CHOICES = ["America/Chicago", "America/New_York", "America/Denver", "America/
               "America/Mexico_City", "America/Bogota", "America/Lima", "America/Santiago",
               "America/Argentina/Buenos_Aires", "America/Caracas", "Europe/Madrid", "UTC"]
 # "no-cache" pide a intermediarios (CDN) no servir copias viejas; no todos lo respetan, por eso se mide la edad real.
-UA = {"User-Agent": "kalshi-btc15-analyzer/2.0", "Accept": "application/json",
+UA = {"User-Agent": "kalshi-btc15-analyzer/2.1", "Accept": "application/json",
       "Cache-Control": "no-cache", "Pragma": "no-cache"}
 PRICE_KEYS = ("yes_bid", "yes_ask", "no_bid", "no_ask")
 CANDLE_SPAN_MIN = 290         # minutos pedidos a Coinbase (límite de la API: 300 velas por solicitud)
@@ -82,6 +86,9 @@ DECISION_FILTERS = [
     ("depth", "Liquidez (contratos disponibles)"),
     ("uncertainty", "Incertidumbre"),
 ]
+
+# Perfiles de sensibilidad: (ventaja mínima ¢, margen extra si no calibrado ¢, deslizamiento ¢)
+PROFILES = {"Conservador": (4.0, 2.0, 1.0), "Equilibrado": (2.5, 1.0, 0.5), "Sensible": (1.5, 0.0, 0.5)}
 
 
 @dataclass
@@ -927,6 +934,18 @@ def decide(p_yes: float, q: dict, tau_min: float, cfg: Cfg, calibrated: bool,
     return out
 
 
+def compute_lean(p_final: Optional[float], dec: dict) -> Optional[dict]:
+    """INCLINACIÓN: hacia qué lado apunta el modelo cuando la señal es ESPERAR y cuántos ¢ de ventaja faltan.
+    Es solo informativa: NO es una señal de compra y nunca dispara órdenes."""
+    if p_final is None or dec.get("signal") != "ESPERAR" or dec.get("req_edge") is None:
+        return None
+    side = "UP" if p_final >= 0.5 else "DOWN"
+    s = (dec.get("sides") or {}).get(side)
+    if not s:
+        return None
+    return {"side": side, "p": s["p"], "edge": s["edge"], "missing": max(dec["req_edge"] - s["edge"], 0.0)}
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # BACKTESTING
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1057,10 +1076,6 @@ def run_backtest(df_raw: pd.DataFrame, cfg: Cfg, elapsed_points=(3, 6, 9, 12), t
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# ESTADO, HISTORIAL Y UTILIDADES DE UI
-# ──────────────────────────────────────────────────────────────────────────────
-
-# ──────────────────────────────────────────────────────────────────────────────
 # OPERACIÓN AUTOMÁTICA (órdenes en Kalshi) — APAGADA por defecto
 # ──────────────────────────────────────────────────────────────────────────────
 # Capas de seguridad: (1) modo Apagado/Simulación/REAL; (2) REAL exige KALSHI_LIVE_OK=1 + escribir OPERAR;
@@ -1068,6 +1083,7 @@ def run_backtest(df_raw: pd.DataFrame, cfg: Cfg, elapsed_points=(3, 6, 9, 12), t
 # quedan órdenes abiertas); (5) tope por operación, por día, pérdida diaria y exposición; (6) UNA orden por
 # contrato (registro en trade_log.csv + client_order_id fijo); (7) si una orden queda en duda (timeout/5xx)
 # se DETIENE todo hasta que la revises en tu cuenta. Las órdenes POST nunca se reintentan solas.
+# La INCLINACIÓN (lean) es solo informativa: nunca dispara órdenes.
 KALSHI_TRADE_BASE = os.getenv("KALSHI_TRADE_BASE", KALSHI_BASE)
 TRADE_LOG = "trade_log.csv"
 TRADE_COLS = ["ts_utc", "modo", "ticker", "lado", "contratos", "precio_limite", "estado", "order_id", "fill",
@@ -1380,6 +1396,9 @@ def render_trading(R: dict, cfg: Cfg, tcfg: TradeCfg) -> None:
                    "Una señal es una estimación, no una garantía: puedes perder lo que operes.")
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# ESTADO, HISTORIAL Y UTILIDADES DE UI
+# ──────────────────────────────────────────────────────────────────────────────
 HIST_COLS = ["hora_utc", "contrato", "señal", "btc", "referencia", "yes_ask", "no_ask", "prob_modelo",
              "ventaja", "seg_restantes", "incertidumbre", "motivo", "bloqueo", "cierre_utc", "resultado", "acierto"]
 
@@ -1466,6 +1485,9 @@ button, [role="tab"] {min-height:44px;}
 .sig-label {color:#a78bfa;letter-spacing:.2em;font-size:.72rem;}
 .sig-main {font-size:2.3rem;font-weight:800;line-height:1.1;}
 .sig-sub {color:#cfc8ea;font-size:.85rem;margin-top:4px;word-break:break-all;}
+.lean {margin-top:8px;padding:.4rem .6rem;border-radius:10px;background:#1d1838;border:1px dashed #6d5bd0;
+       color:#e4defa;font-size:.82rem;line-height:1.35;text-align:left;}
+.lean b.up {color:#4ade80;} .lean b.down {color:#f87171;}
 .why {margin:.55rem 0 .2rem;padding:.55rem .7rem;border-radius:12px;background:#2a1d0a;border:1px solid #7a4a0a;
       color:#fde7bd;font-size:.85rem;line-height:1.35;}
 .note {margin:.4rem 0;padding:.5rem .7rem;border-radius:12px;background:#12203a;border:1px solid #28508f;
@@ -1499,11 +1521,11 @@ table.tb td:first-child {color:#a78bfa;}
 """
 
 
-def signal_card(signal: str, subtitle: str) -> str:
+def signal_card(signal: str, subtitle: str, lean_html: str = "") -> str:
     color = {"BUY UP": "#22c55e", "BUY DOWN": "#ef4444", "ESPERAR": "#f59e0b"}.get(signal, "#a78bfa")
     return (f'<div class="sig" style="border-color:{color}"><div class="sig-label">SEÑAL</div>'
             f'<div class="sig-main" style="color:{color}">{esc(signal)}</div>'
-            f'<div class="sig-sub">{esc(subtitle)}</div></div>')
+            f'<div class="sig-sub">{esc(subtitle)}</div>{lean_html}</div>')
 
 
 def kv_html(rows: List[Tuple[str, Any]]) -> str:
@@ -1859,6 +1881,7 @@ def analyze(cfg: Cfg, forced: Optional[str]) -> dict:
                "filters": [mkf(i, n, "na", blocking=False) for i, n in DECISION_FILTERS]}
     else:
         dec = decide(p_final, q, tau_min, cfg, calibrated, problems, unc, "; ".join(why_unc))
+    lean = compute_lean(p_final, dec)
     all_filters = F + dec["filters"]
     blockers = [f_ for f_ in all_filters if f_["status"] == "fail" and f_["blocking"]]
 
@@ -1872,7 +1895,7 @@ def analyze(cfg: Cfg, forced: Optional[str]) -> dict:
             "row": row, "n_gap": n_gap, "lag": lag, "mp": mp, "p_final": p_final, "p_model_yes": p_model_yes,
             "p_nd_yes": p_nd_yes, "platt": platt_used, "unc": unc, "why_unc": why_unc, "unc_pts": unc_pts,
             "calibrated": calibrated, "notes_model": notes_model, "q": q, "implied": implied, "dec": dec,
-            "signal": dec["signal"], "filters": all_filters, "blockers": blockers, "alerts": alerts,
+            "signal": dec["signal"], "lean": lean, "filters": all_filters, "blockers": blockers, "alerts": alerts,
             "fresh": {"level": fresh_level, "why": fresh_why}, "data_log": dict(dl)}
 
 
@@ -1894,7 +1917,7 @@ def reading_rows(R: dict) -> Dict[str, List[Tuple[str, str]]]:
             ("Prob. implícita Kalshi (YES, punto medio)", pct(R["implied"])),
             ("Diferencia modelo − mercado", "—" if R["implied"] is None else f"{(R['p_final'] - R['implied']) * 100:+.1f} pts"),
             ("Último precio operado YES", "—" if mk is None else cents(mk.get("last_price"))),
-            ("Modelo calibrado", "Sí" if R["calibrated"] else "No (+2¢ de margen y +1 pt de incertidumbre)"),
+            ("Modelo calibrado", "Sí" if R["calibrated"] else "No (margen extra y +1 pt de incertidumbre)"),
         ]
     else:
         probs.append(("Probabilidad", "no calculada (faltan datos: mira los filtros ⛔)"))
@@ -2008,7 +2031,7 @@ def edge_explanation(R: dict, cfg: Cfg) -> str:
         txt += (" Una probabilidad alta NO es una ventaja por sí sola: si el mercado ya la cobra a ese precio, "
                 "no hay nada que ganar y el filtro hace bien en decir ESPERAR.")
     if not R["calibrated"]:
-        txt += (f" Como el modelo no está validado, se suman {cfg.uncal_extra * 100:.0f}¢ de margen "
+        txt += (f" Como el modelo no está validado, se suman {cfg.uncal_extra * 100:.1f}¢ de margen "
                 "(ejecuta el Backtest para validarlo; no se activa solo).")
     return txt
 
@@ -2016,8 +2039,11 @@ def edge_explanation(R: dict, cfg: Cfg) -> str:
 def build_diag_text(R: dict, cfg: Cfg) -> str:
     L = [f"DIAGNÓSTICO {loc(R['now'], '%Y-%m-%d %H:%M:%S')} local / {R['now'].strftime('%H:%M:%S')} UTC",
          f"Señal: {R['signal']}  ·  Frescura: {R['fresh']['level']}",
-         f"Contrato: {R['ctr'].ticker if R['ctr'] else '—'}  cierre: {loc(R['mk']['close_time']) if R['mk'] else '—'}",
-         "", "FILTROS"]
+         f"Contrato: {R['ctr'].ticker if R['ctr'] else '—'}  cierre: {loc(R['mk']['close_time']) if R['mk'] else '—'}"]
+    if R.get("lean"):
+        ln = R["lean"]
+        L.append(f"Inclinación: {ln['side']} {pct(ln['p'])} · ventaja {ln['edge'] * 100:+.1f}¢ · faltan {ln['missing'] * 100:.1f}¢")
+    L += ["", "FILTROS"]
     for f_ in R["filters"]:
         tag = {"ok": "OK   ", "fail": "FALLA", "warn": "AVISO", "na": "N/D  "}[f_["status"]]
         L.append(f"[{tag}] {f_['name']}: {f_['value']}" + (f" | límite {f_['limit']}" if f_["limit"] else "")
@@ -2104,10 +2130,25 @@ def status_panel(now: datetime) -> None:
     st.markdown("".join(rows), unsafe_allow_html=True)
 
 
+def lean_block(R: dict) -> str:
+    """Bloque HTML con la inclinación del modelo (solo cuando la señal es ESPERAR y hay datos suficientes)."""
+    ln = R.get("lean")
+    if not ln or R["signal"] != "ESPERAR":
+        return ""
+    cls = "up" if ln["side"] == "UP" else "down"
+    if ln["missing"] <= 1e-9:
+        gap = "la ventaja ya alcanza, pero otro filtro bloquea (ver abajo)"
+    else:
+        gap = f"faltan <b>{ln['missing'] * 100:.1f}¢</b> de ventaja neta para operar"
+    return (f"<div class='lean'>🧭 Inclinación: <b class='{cls}'>{ln['side']}</b> · modelo {pct(ln['p'])} · "
+            f"ventaja actual {ln['edge'] * 100:+.1f}¢ · {gap}.<br>"
+            f"<span style='color:#9a90c4'>Es solo una lectura informativa: <b>no es una señal de compra</b>.</span></div>")
+
+
 def render_header(R: dict, cfg: Cfg) -> None:
     ctr, tau = R["ctr"], R["tau_min"]
     sub = f"{ctr.ticker} · quedan {fmt_left(tau * 60)}" if (ctr is not None and tau is not None) else "Sin contrato analizable"
-    st.markdown(signal_card(R["signal"], sub), unsafe_allow_html=True)
+    st.markdown(signal_card(R["signal"], sub, lean_block(R)), unsafe_allow_html=True)
     if R["signal"] == "ESPERAR" and R["blockers"]:
         b = R["blockers"][0]
         extra = f"  (+{len(R['blockers']) - 1} bloqueo(s) más)" if len(R["blockers"]) > 1 else ""
@@ -2250,7 +2291,7 @@ def render_explanation(R: dict, cfg: Cfg) -> None:
             ask_ref = dec["sides"][best]["ask"]
             st.caption(f"Comisión de ejemplo para 10 contratos a {cents(ask_ref)}: "
                        f"${kalshi_fee_order(10, ask_ref, cfg.fee_rate):.2f} (se redondea al centavo por orden). "
-                       f"Incluye deslizamiento supuesto de {cfg.slippage * 100:.0f}¢.")
+                       f"Incluye deslizamiento supuesto de {cfg.slippage * 100:.1f}¢.")
         st.caption("Estimación estadística, no una certeza: ninguna señal garantiza ganancias.")
 
 
@@ -2517,6 +2558,24 @@ def selftest() -> List[Tuple[str, bool, str]]:
     d5 = decide(0.20, q_ok, 5, cfg, True, [], "Baja")
     chk("decisión: probabilidad baja de YES con NO barato → BUY DOWN", d5["signal"] == "BUY DOWN")
 
+    # 8b) inclinación (lean) y perfiles
+    d6 = decide(0.62, q_ok, 5, cfg, True, [], "Baja")          # leve ventaja: no alcanza → ESPERAR con inclinación
+    ln6 = compute_lean(0.62, d6)
+    chk("inclinación: ESPERAR con p=62 % a 60¢ apunta a UP y muestra cuánto falta",
+        d6["signal"] == "ESPERAR" and ln6 is not None and ln6["side"] == "UP" and ln6["missing"] > 0, str(ln6))
+    chk("inclinación: no aparece cuando hay BUY", compute_lean(0.80, d2) is None)
+    chk("inclinación: sin probabilidad no hay inclinación", compute_lean(None, d6) is None)
+    q_mid = {"yes_ask": 0.50, "yes_bid": 0.48, "no_ask": 0.52, "no_bid": 0.50, "yes_ask_size": 200, "yes_bid_size": 200}
+    ln7 = compute_lean(0.45, decide(0.45, q_mid, 5, cfg, True, [], "Baja"))
+    chk("inclinación: p(YES)=45 % con ventaja débil apunta a DOWN", ln7 is not None and ln7["side"] == "DOWN", str(ln7))
+    chk("perfiles: Sensible exige menos ventaja que Conservador",
+        PROFILES["Sensible"][0] < PROFILES["Equilibrado"][0] < PROFILES["Conservador"][0])
+    cfg_s = Cfg(min_edge=PROFILES["Sensible"][0] / 100, uncal_extra=PROFILES["Sensible"][1] / 100,
+                slippage=PROFILES["Sensible"][2] / 100)
+    chk("perfiles: una señal débil que Conservador rechaza, Sensible la acepta",
+        decide(0.66, q_ok, 5, Cfg(), False, [], "Baja")["signal"] == "ESPERAR"
+        and decide(0.66, q_ok, 5, cfg_s, False, [], "Baja")["signal"] == "BUY UP")
+
     # 9) modelo
     p_far = model_prob(100_300, 100_000, 5, 4e-4, 0.0, cfg)["p"]
     p_near = model_prob(100_010, 100_000, 5, 4e-4, 0.0, cfg)["p"]
@@ -2614,7 +2673,15 @@ def render_help() -> None:
 * **BUY UP / BUY DOWN** — El modelo estima una probabilidad mayor que el costo de equilibrio del lado (precio de compra +
   comisión + deslizamiento) más la ventaja mínima, y **todos** los filtros bloqueantes están en verde.
 * **ESPERAR** — Falta algún dato fresco, hay contradicciones o la ventaja neta no alcanza. Abre **🔎 Diagnóstico**.
+* **🧭 Inclinación** — Aparece bajo ESPERAR: hacia qué lado apunta el modelo y **cuántos ¢ de ventaja faltan**.
+  Es solo informativa; **no es una señal de compra** y nunca dispara órdenes.
 * Es una **estimación estadística**: nunca una certeza ni una garantía de ganancia.
+
+### Perfiles de sensibilidad
+* **Conservador** (4¢ de ventaja, +2¢ si no calibrado, 1¢ de deslizamiento) · **Equilibrado** (2.5¢ / 1¢ / 0.5¢) ·
+  **Sensible** (1.5¢ / 0¢ / 0.5¢).
+* Un perfil más sensible da **más señales**, pero **no crea ventaja**: con comisiones, la rentabilidad esperada puede
+  ser cercana a cero o negativa. Pruébalo primero en **Simulación**.
 
 ### Semáforo de frescura
 * 🟢 Todo dentro de límites · 🟡 retraso leve o un intento fallido (se usa el dato anterior, con su edad real) ·
@@ -2623,12 +2690,10 @@ def render_help() -> None:
   de cada fuente, y la antigüedad siempre se cuenta desde la descarga original, nunca desde el redibujado.
 
 ### Sobre el retraso de las velas
-La causa más probable está en la consulta, no en la pantalla: la versión anterior pedía las velas **sin `start`/`end`**
-(una URL idéntica para todos, susceptible de copias en caché) y además guardaba la respuesta en `st.cache_data`.
-Esta versión pide ventanas explícitas, envía `Cache-Control: no-cache`, mide la edad real de cada respuesta
-(`Date`/`Age`), consulta una fuente de respaldo cuando la principal se atrasa y **bloquea** si ninguna entrega datos
-recientes. No fabrica velas: los huecos al final se muestran como retraso. Ejecuta `python app.py --live-check` en tu red
-para ver el retraso real de cada fuente.
+Esta versión pide ventanas explícitas (`start`/`end`), envía `Cache-Control: no-cache`, mide la edad real de cada
+respuesta (`Date`/`Age`), consulta una fuente de respaldo cuando la principal se atrasa y **bloquea** si ninguna entrega
+datos recientes. No fabrica velas: los huecos al final se muestran como retraso. Ejecuta `python app.py --live-check`
+en tu red para ver el retraso real de cada fuente.
 
 ### Operación automática (opcional)
 Modos: **Apagado**, **Simulación** (registra lo que haría, no envía nada) y **REAL**. REAL exige `KALSHI_LIVE_OK=1`,
@@ -2684,12 +2749,16 @@ def main() -> None:
             forced = None if choice.startswith("Automático") else choice
         else:
             st.caption("No se pudo listar contratos de Kalshi ahora mismo.")
-        with st.expander("Umbrales de la señal", expanded=False):
-            min_edge = st.slider("Ventaja neta mínima (¢)", 1.0, 15.0, 4.0, 0.5)
-            extra = st.slider("Margen extra si no está calibrado (¢)", 0.0, 10.0, 2.0, 0.5)
+        perfil = st.selectbox("Perfil de sensibilidad", list(PROFILES.keys()), index=1,
+                              help="Más sensible = más señales, pero NO crea ventaja: con comisiones la "
+                                   "rentabilidad esperada puede ser cercana a cero o negativa. Prueba en Simulación.")
+        P_EDGE, P_EXTRA, P_SLIP = PROFILES[perfil]
+        with st.expander("Umbrales de la señal (ajuste fino)", expanded=False):
+            min_edge = st.slider("Ventaja neta mínima (¢)", 1.0, 15.0, P_EDGE, 0.5, key=f"edge_{perfil}")
+            extra = st.slider("Margen extra si no está calibrado (¢)", 0.0, 10.0, P_EXTRA, 0.5, key=f"extra_{perfil}")
             max_spread = st.slider("Spread máximo (¢)", 1, 20, 8)
             min_depth = st.slider("Contratos mínimos al precio de entrada", 1, 100, 5)
-            slip = st.slider("Deslizamiento supuesto (¢)", 0.0, 5.0, 1.0, 0.5)
+            slip = st.slider("Deslizamiento supuesto (¢)", 0.0, 5.0, P_SLIP, 0.5, key=f"slip_{perfil}")
             fee_rate = st.number_input("Tasa de comisión taker", 0.0, 0.2, 0.07, 0.005, format="%.3f")
             min_tau = st.slider("Segundos mínimos restantes", 15, 180, 45)
         with st.expander("Frescura de datos", expanded=False):
