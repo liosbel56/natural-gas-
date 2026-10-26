@@ -11,6 +11,7 @@ Kalshi Signal Bot — SOLO BTC/USD · contratos KXBTC15M (15 minutos)
 NOVEDADES de esta versión:
   - Muestra la INCLINACIÓN (UP/DOWN) y cuántos ¢ de ventaja FALTAN cuando la señal es ESPERAR.
   - Perfiles de sensibilidad (Conservador / Equilibrado / Sensible) en la barra lateral.
+  - SEÑAL TEMPRANA: una dirección (UP/DOWN) por cada ventana de 15 min, emitida al inicio, sin exigir 80–90 %.
 
 Instalar:        pip install "streamlit>=1.37" pandas numpy requests plotly cryptography
 Ejecutar:        streamlit run app.py
@@ -28,7 +29,7 @@ import re
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -117,6 +118,10 @@ class Cfg:
     chart_minutes: int = 60
     use_backtest: bool = True
     sim_half_spread: float = 0.01
+    early_on: bool = True          # emitir señal temprana (1 por contrato de 15 min)
+    early_after_s: int = 30        # segundos tras el inicio de la ventana para emitirla
+    early_lock: bool = True        # mantener la dirección durante toda la ventana
+    early_drift: float = 0.60      # peso de la tendencia (σ) en la señal temprana
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -944,6 +949,54 @@ def compute_lean(p_final: Optional[float], dec: dict) -> Optional[dict]:
     if not s:
         return None
     return {"side": side, "p": s["p"], "edge": s["edge"], "missing": max(dec["req_edge"] - s["edge"], 0.0)}
+
+
+def compute_early(ss: Any, cfg: Cfg, ctr: Optional[Contract], now: datetime, row: Optional[pd.Series],
+                  S0: Optional[float], tau_min: Optional[float], q: dict, fresh_level: str) -> Optional[dict]:
+    """SEÑAL TEMPRANA: una dirección por ventana, emitida al inicio y fijada para toda la ventana.
+    Usa la tendencia (score) con más peso que el modelo normal, porque al inicio el precio está pegado
+    a la referencia y la distancia casi no informa. NO exige 80–90 %: solo datos válidos y no ROJOS.
+    NO es la señal BUY (esa sigue exigiendo ventaja neta) y NUNCA dispara órdenes."""
+    if not cfg.early_on or ctr is None:
+        return None
+    store = ss.setdefault("early_calls", {})
+    saved = store.get(ctr.ticker)
+    elapsed = (now - ctr.window_start).total_seconds()
+
+    live = None
+    if row is not None and S0 and ctr.reference and tau_min is not None and tau_min > 0 and bool(row["valid"]):
+        c2 = replace(cfg, drift_cap=max(cfg.drift_cap, cfg.early_drift))
+        mp2 = model_prob(S0, ctr.reference, tau_min, float(row["sigma"]), float(row["score"]), c2)
+        p_yes = mp2["p"] if ctr.yes_if_above else 1 - mp2["p"]
+        side = "UP" if p_yes >= 0.5 else "DOWN"
+        live = {"side": side, "p": p_yes if side == "UP" else 1 - p_yes}
+
+    if saved is not None:
+        out = dict(saved, state="emitted", live=live, elapsed=elapsed)
+        out["reversal"] = bool(live and live["side"] != saved["side"] and live["p"] >= 0.60)
+        if not cfg.early_lock and live:
+            out["side"], out["p"] = live["side"], live["p"]
+        return out
+    if elapsed < cfg.early_after_s:
+        return {"state": "pending", "wait_s": cfg.early_after_s - elapsed}
+    if not ctr.supported or ctr.reference is None or live is None or S0 is None:
+        return {"state": "blocked", "why": "faltan datos válidos del contrato o del modelo"}
+    if fresh_level == "red":
+        return {"state": "blocked", "why": "datos obsoletos (semáforo rojo): no se emite una dirección con datos viejos"}
+    ask = q.get("yes_ask") if live["side"] == "UP" else q.get("no_ask")
+    edge = None if ask is None else live["p"] - (ask + kalshi_fee(ask, cfg.fee_rate) + cfg.slippage)
+    rec = {"side": live["side"], "p": live["p"], "ask": ask, "edge": edge, "btc": S0, "ref": ctr.reference,
+           "at": now, "elapsed": elapsed}
+    store[ctr.ticker] = rec
+    hist: List[dict] = ss.history
+    hist.append({"hora_utc": now.strftime("%Y-%m-%d %H:%M:%S"), "contrato": ctr.ticker, "señal": f"EARLY {live['side']}",
+                 "btc": round(S0, 2), "referencia": ctr.reference, "yes_ask": q.get("yes_ask"), "no_ask": q.get("no_ask"),
+                 "prob_modelo": round(live["p"], 4), "ventaja": None if edge is None else round(edge, 4),
+                 "seg_restantes": round(tau_min * 60), "incertidumbre": "—", "motivo": "señal temprana",
+                 "bloqueo": "", "cierre_utc": ctr.close_time.strftime("%Y-%m-%d %H:%M:%S"),
+                 "resultado": None, "acierto": None})
+    save_history(hist)
+    return dict(rec, state="emitted", live=live, reversal=False)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1890,12 +1943,13 @@ def analyze(cfg: Cfg, forced: Optional[str]) -> dict:
                 ("Coinbase · precio", "Coinbase · velas 1m", "Kalshi · mercados")
                 if (stat.get(n) or {}).get("ok") is False]
     fresh_level, fresh_why = freshness(age_of(tick), ta, lag, a_k, conn_err, cfg)
+    early = compute_early(ss, cfg, ctr, now, row, S0, tau_min, q, fresh_level)
     return {"now": now, "cfg": cfg, "forced": forced, "tick": tick, "cand": cand, "kal": kal, "mk": mk, "ctr": ctr,
             "open_markets": open_markets, "S0": S0, "tau_min": tau_min, "f": f, "closed": closed, "forming": forming,
             "row": row, "n_gap": n_gap, "lag": lag, "mp": mp, "p_final": p_final, "p_model_yes": p_model_yes,
             "p_nd_yes": p_nd_yes, "platt": platt_used, "unc": unc, "why_unc": why_unc, "unc_pts": unc_pts,
             "calibrated": calibrated, "notes_model": notes_model, "q": q, "implied": implied, "dec": dec,
-            "signal": dec["signal"], "lean": lean, "filters": all_filters, "blockers": blockers, "alerts": alerts,
+            "signal": dec["signal"], "lean": lean, "early": early, "filters": all_filters, "blockers": blockers, "alerts": alerts,
             "fresh": {"level": fresh_level, "why": fresh_why}, "data_log": dict(dl)}
 
 
@@ -2085,7 +2139,7 @@ def log_signal(rec: dict) -> None:
 def resolve_history(now: datetime) -> None:
     """Rellena el resultado real (yes/no) de señales BUY ya vencidas, consultando a Kalshi."""
     hist: List[dict] = st.session_state.history
-    pending = [h for h in hist if str(h.get("señal", "")).startswith("BUY") and not h.get("resultado")]
+    pending = [h for h in hist if str(h.get("señal", "")).startswith(("BUY", "EARLY")) and not h.get("resultado")]
     done = 0
     cache: Dict[str, Optional[str]] = {}
     for h in pending:
@@ -2105,7 +2159,8 @@ def resolve_history(now: datetime) -> None:
         res = cache[t]
         if res:
             h["resultado"] = res
-            h["acierto"] = bool((h["señal"] == "BUY UP" and res == "yes") or (h["señal"] == "BUY DOWN" and res == "no"))
+            h["acierto"] = bool((h["señal"] in ("BUY UP", "EARLY UP") and res == "yes")
+                            or (h["señal"] in ("BUY DOWN", "EARLY DOWN") and res == "no"))
     if done:
         save_history(hist)
 
@@ -2143,6 +2198,34 @@ def lean_block(R: dict) -> str:
     return (f"<div class='lean'>🧭 Inclinación: <b class='{cls}'>{ln['side']}</b> · modelo {pct(ln['p'])} · "
             f"ventaja actual {ln['edge'] * 100:+.1f}¢ · {gap}.<br>"
             f"<span style='color:#9a90c4'>Es solo una lectura informativa: <b>no es una señal de compra</b>.</span></div>")
+
+
+def render_early(R: dict) -> None:
+    e = R.get("early")
+    if e is None:
+        return
+    if e["state"] == "pending":
+        st.markdown(f"<div class='note'>⏱ Señal temprana de esta ventana en ~{max(e['wait_s'], 0):.0f} s.</div>",
+                    unsafe_allow_html=True)
+        return
+    if e["state"] == "blocked":
+        st.markdown(f"<div class='why'>⏸ Señal temprana no emitida: {esc(e['why'])}.</div>", unsafe_allow_html=True)
+        return
+    color = "#22c55e" if e["side"] == "UP" else "#ef4444"
+    word = "SUBE · comprar YES" if e["side"] == "UP" else "BAJA · comprar NO"
+    ask = "—" if e.get("ask") is None else cents(e["ask"])
+    edge = "—" if e.get("edge") is None else f"{e['edge'] * 100:+.1f}¢"
+    rev = ""
+    if e.get("reversal") and e.get("live"):
+        rev = (f"<div class='lean'>⚠️ Ahora el modelo apunta a <b>{e['live']['side']}</b> ({pct(e['live']['p'])}). "
+               "La señal temprana sigue fijada; úsalo como aviso de posible giro.</div>")
+    st.markdown(
+        f"<div class='sig' style='border-color:{color};margin-top:8px'><div class='sig-label'>SEÑAL TEMPRANA · ESTA VENTANA</div>"
+        f"<div class='sig-main' style='color:{color}'>{esc(e['side'])}</div>"
+        f"<div class='sig-sub'>{word} · emitida a los {e['elapsed']:.0f} s · modelo {pct(e['p'])}<br>"
+        f"precio de compra {ask} · ventaja neta {edge} tras comisión</div>{rev}</div>"
+        "<div class='fm' style='margin:.3rem 0'>Es una dirección estimada, no una garantía. Una ventaja neta negativa "
+        "significa que, a ese precio, el mercado ya cobra esa probabilidad.</div>", unsafe_allow_html=True)
 
 
 def render_header(R: dict, cfg: Cfg) -> None:
@@ -2337,6 +2420,7 @@ def render_live(cfg: Cfg, forced: Optional[str], tcfg: Optional[TradeCfg] = None
     record_wait(R)
     auto_trade(R, cfg, tcfg)
     render_header(R, cfg)
+    render_early(R)
     render_freshness(R, cfg)
     render_metrics(R)
     render_trading(R, cfg, tcfg)
@@ -2376,6 +2460,11 @@ def render_history() -> None:
     st.caption(f"Señales BUY: {len(buys)} · resueltas: {len(res)} · aciertos: {k}"
                + (f" ({k / len(res) * 100:.0f}%)" if len(res) else "")
                + "  — muestra pequeña: no es evidencia estadística.")
+    ear = h[h["señal"].astype(str).str.startswith("EARLY")]
+    ear_r = ear[ear["resultado"].notna() & (ear["resultado"] != "")]
+    ke = int((ear_r["acierto"].astype(str) == "True").sum())
+    st.caption(f"Señales tempranas: {len(ear)} · resueltas: {len(ear_r)} · aciertos: {ke}"
+               + (f" ({ke / len(ear_r) * 100:.0f}%)" if len(ear_r) else ""))
     v = h.iloc[::-1].head(60).copy()
     try:
         v["hora"] = pd.to_datetime(v["hora_utc"], utc=True).dt.tz_convert(LOCAL_TZ).dt.strftime("%H:%M:%S")
@@ -2586,6 +2675,34 @@ def selftest() -> List[Tuple[str, bool, str]]:
         freshness(2, 3, 30, 2, [], cfg)[0] == "green" and freshness(2, 3, 100, 2, [], cfg)[0] == "yellow"
         and freshness(2, 3, 200, 2, [], cfg)[0] == "red" and freshness(None, 3, 30, 2, [], cfg)[0] == "red")
 
+    # 10b) señal temprana: una por ventana, fija, sin exigir 80–90 %
+    class _SS(dict):
+        __getattr__ = dict.__getitem__
+    _orig_save = globals()["save_history"]
+    globals()["save_history"] = lambda h: None
+    try:
+        ws = datetime(2026, 10, 23, 12, 0, 0, tzinfo=timezone.utc)
+        ctr_e = Contract("KXBTC15M-E1", "t", ws + timedelta(minutes=15), ws, 100_000.0, "umbral", True, True, [], "")
+        row_e = pd.Series({"valid": True, "sigma": 4e-4, "score": 0.6})
+        q_e = {"yes_ask": 0.55, "no_ask": 0.47}
+        ss_e = _SS(history=[])
+        e0 = compute_early(ss_e, cfg, ctr_e, ws + timedelta(seconds=10), row_e, 100_020.0, 14.8, q_e, "green")
+        chk("temprana: antes del tiempo configurado queda pendiente", e0 is not None and e0["state"] == "pending")
+        e1 = compute_early(ss_e, cfg, ctr_e, ws + timedelta(seconds=40), row_e, 100_020.0, 14.3, q_e, "green")
+        chk("temprana: emite UP con tendencia alcista sin exigir 80–90 %",
+            e1["state"] == "emitted" and e1["side"] == "UP" and e1["p"] < 0.80, str(e1))
+        e2 = compute_early(ss_e, cfg, ctr_e, ws + timedelta(seconds=100), row_e.copy(), 99_900.0, 13.3, q_e, "green")
+        chk("temprana: una sola por contrato y la dirección queda fija",
+            len([h for h in ss_e["history"] if str(h["señal"]).startswith("EARLY")]) == 1 and e2["side"] == "UP"
+            and e2["reversal"] is True, str(e2))
+        e3 = compute_early(_SS(history=[]), cfg, ctr_e, ws + timedelta(seconds=40), row_e, 100_020.0, 14.3, q_e, "red")
+        chk("temprana: con semáforo ROJO no se emite", e3["state"] == "blocked")
+        chk("temprana: desactivada → None",
+            compute_early(_SS(history=[]), replace(cfg, early_on=False), ctr_e, ws + timedelta(seconds=40), row_e,
+                          100_020.0, 14.3, q_e, "green") is None)
+    finally:
+        globals()["save_history"] = _orig_save
+
     # 11) operación: cuerpo de la orden, guardas y firma
     chk("orden: BUY UP → yes + precio YES en dólares + fill_or_kill",
         build_order_body("KXBTC15M-X1", "UP", 2, 0.57, "b-X")
@@ -2676,6 +2793,12 @@ def render_help() -> None:
 * **🧭 Inclinación** — Aparece bajo ESPERAR: hacia qué lado apunta el modelo y **cuántos ¢ de ventaja faltan**.
   Es solo informativa; **no es una señal de compra** y nunca dispara órdenes.
 * Es una **estimación estadística**: nunca una certeza ni una garantía de ganancia.
+
+### Señal temprana (una por ventana)
+* Al inicio de cada ventana de 15 min la app emite **una dirección (UP/DOWN)** usando sobre todo la tendencia, **sin
+  esperar** a que la probabilidad llegue a 80–90 %. Queda fijada toda la ventana; si el modelo cambia, solo avisa de un giro.
+* Muestra el precio de compra y la **ventaja neta** real: si es negativa, el mercado ya cobra esa probabilidad.
+* **No es la señal BUY** y nunca envía órdenes. Su acierto se mide en el historial (señales «EARLY»).
 
 ### Perfiles de sensibilidad
 * **Conservador** (4¢ de ventaja, +2¢ si no calibrado, 1¢ de deslizamiento) · **Equilibrado** (2.5¢ / 1¢ / 0.5¢) ·
@@ -2773,6 +2896,11 @@ def main() -> None:
             drift = st.slider("Peso máximo del score (σ)", 0.0, 0.6, 0.25, 0.05)
             infl = st.slider("Inflación de volatilidad", 1.0, 1.5, 1.10, 0.05)
             use_bt = st.checkbox("Aplicar resultados del último backtest", True)
+        with st.expander("⚡ Señal temprana", expanded=False):
+            early_on = st.checkbox("Emitir 1 señal por ventana de 15 min", True)
+            early_after = st.slider("Emitirla a los (s) del inicio", 10, 180, 30, 5)
+            early_lock = st.checkbox("Mantener la dirección toda la ventana", True)
+            early_drift = st.slider("Peso de la tendencia (σ)", 0.2, 1.0, 0.6, 0.05)
         chart_n = st.slider("Velas en la gráfica", 30, 240, 60, 10)
         st.divider()
         with st.expander("🤖 Operación automática", expanded=False):
@@ -2798,7 +2926,8 @@ def main() -> None:
     cfg = Cfg(refresh_s=refresh, min_edge=min_edge / 100, uncal_extra=extra / 100, max_spread=max_spread / 100,
               min_depth=float(min_depth), fee_rate=fee_rate, slippage=slip / 100, min_tau_min=min_tau / 60,
               basis_bps=basis, drift_cap=drift, sigma_inflate=infl, chart_minutes=chart_n, use_backtest=use_bt,
-              max_age_s=max_age, max_trade_age_s=max_trade, candle_warn_s=min(c_warn, c_max), candle_max_s=c_max)
+              max_age_s=max_age, max_trade_age_s=max_trade, candle_warn_s=min(c_warn, c_max), candle_max_s=c_max,
+              early_on=early_on, early_after_s=early_after, early_lock=early_lock, early_drift=early_drift)
 
     t_live, t_bt, t_help = st.tabs(["Señal", "Backtest", "Ayuda"])
     with t_live:
