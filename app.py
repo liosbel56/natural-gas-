@@ -45,6 +45,8 @@ from requests.adapters import HTTPAdapter
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+import edge_suite  # módulo nuevo: análisis avanzado (edge_suite.py)
+
 # ──────────────────────────────────────────────────────────────────────────────
 # CONSTANTES
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1577,7 +1579,7 @@ table.tb td:first-child {color:#a78bfa;}
 def signal_card(signal: str, subtitle: str, lean_html: str = "") -> str:
     color = {"BUY UP": "#22c55e", "BUY DOWN": "#ef4444", "ESPERAR": "#f59e0b"}.get(signal, "#a78bfa")
     return (f'<div class="sig" style="border-color:{color}"><div class="sig-label">SEÑAL</div>'
-            f'<div class="sig-main" style="color:{color}">{esc(signal)}</div>'
+            f'<div class="sig-main" style="color:{color}">{esc("WAIT" if signal == "ESPERAR" else signal)}</div>'
             f'<div class="sig-sub">{esc(subtitle)}</div>{lean_html}</div>')
 
 
@@ -1661,7 +1663,7 @@ def factor_lines(row: pd.Series, direction: int) -> Tuple[List[str], List[str]]:
 # ──────────────────────────────────────────────────────────────────────────────
 # ANÁLISIS EN VIVO (calcula todo y devuelve un diccionario; sin dibujar nada)
 # ──────────────────────────────────────────────────────────────────────────────
-def analyze(cfg: Cfg, forced: Optional[str]) -> dict:
+def analyze_base(cfg: Cfg, forced: Optional[str]) -> dict:
     ss = st.session_state
     now = utcnow()
     dl = ss.data_log
@@ -2414,7 +2416,95 @@ def record_wait(R: dict) -> None:
         ss.wait_counts[b["id"]] = ss.wait_counts.get(b["id"], 0) + 1
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# INTEGRACIÓN DE edge_suite (Chart Analysis · Smart Exit · Flip Risk · Chop · Confirmación · Contrato · Diagnóstico)
+# ══════════════════════════════════════════════════════════════════════════════
+def _auto_position(ticker: Optional[str]) -> Optional[str]:
+    """Lado (UP/DOWN) de la última orden REAL ejecutada en este contrato según trade_log.csv, si existe."""
+    try:
+        for r in load_trades()[::-1]:
+            if r.get("modo") == "live" and r.get("ticker") == ticker and (_to_float(r.get("fill")) or 0) > 0:
+                return r.get("lado")
+    except Exception:
+        pass
+    return None
+
+
+def analyze(cfg: Cfg, forced: Optional[str]) -> dict:
+    """analyze_base() (tu análisis original, intacto) + compuerta de entrada y módulos de edge_suite.
+    Si el análisis avanzado falla por cualquier motivo, la señal se BLOQUEA (nunca queda un BUY sin revisar)."""
+    R = analyze_base(cfg, forced)
+    x = st.session_state.get("xcfg") or edge_suite.XCfg()
+    auto = _auto_position(R["ctr"].ticker) if (x.position == "AUTO" and R.get("ctr") is not None) else None
+    try:
+        return edge_suite.enhance(R, x, compute_lean, auto)
+    except Exception as e:  # noqa: BLE001
+        msg = f"{type(e).__name__}: {str(e)[:160]}"
+        dec = R["dec"]
+        f_ = edge_suite.mkfilter("adv", "Análisis avanzado", "fail", "error", "", "Falló el análisis avanzado (" + msg + "): señal bloqueada por seguridad.")
+        dec["signal"], dec["side"] = "ESPERAR", None
+        dec["filters"] = list(dec["filters"]) + [f_]
+        R["filters"] = list(R["filters"]) + [f_]
+        R["blockers"] = [x_ for x_ in R["filters"] if x_["status"] == "fail" and x_["blocking"]]
+        R["signal"] = "ESPERAR"
+        R["lean"] = compute_lean(R.get("p_final"), dec)
+        R["X"] = {"ok": False, "why": "Error en el análisis avanzado: " + msg}
+        return R
+
+
 def render_live(cfg: Cfg, forced: Optional[str], tcfg: Optional[TradeCfg] = None) -> None:
+    """Dashboard oscuro: señal · riesgo · smart exit · gráfico · análisis técnico · diagnóstico de datos."""
+    tcfg = tcfg or TradeCfg()
+    R = analyze(cfg, forced)
+    record_wait(R)
+    auto_trade(R, cfg, tcfg)
+    X = R["X"]
+    with st.container(key="dash"):
+        edge_suite.render_topbar(R, LOCAL_TZ)
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            render_header(R, cfg)
+            render_early(R)
+            edge_suite.render_confirmation(X)
+        with c2:
+            edge_suite.render_flip(X)
+            edge_suite.render_chop(X)
+        with c3:
+            edge_suite.render_exit(X)
+            edge_suite.render_contract(X)
+        edge_suite.render_chart(R, cfg.chart_minutes, LOCAL_TZ)
+        c4, c5 = st.columns(2)
+        with c4:
+            edge_suite.render_chart_analysis(X)
+        with c5:
+            edge_suite.render_data_diagnostics(R, cfg, LOCAL_TZ)
+    render_metrics(R)
+    render_trading(R, cfg, tcfg)
+    render_diagnostics(R, cfg)
+    render_explanation(R, cfg)
+    with st.expander("Frescura detallada y conexiones (panel original)"):
+        render_freshness(R, cfg)
+        status_panel(R["now"])
+    render_contract(R)
+
+    ctr, now, dec, q = R["ctr"], R["now"], R["dec"], R["q"]
+    if ctr is not None:
+        log_signal({"hora_utc": now.strftime("%Y-%m-%d %H:%M:%S"), "contrato": ctr.ticker, "señal": R["signal"],
+                    "btc": None if R["S0"] is None else round(R["S0"], 2), "referencia": ctr.reference,
+                    "yes_ask": q["yes_ask"], "no_ask": q["no_ask"],
+                    "prob_modelo": None if R["p_final"] is None else round(R["p_final"], 4),
+                    "ventaja": None if not dec.get("side") else round(dec["sides"][dec["side"]]["edge"], 4),
+                    "seg_restantes": None if R["tau_min"] is None else round(R["tau_min"] * 60),
+                    "incertidumbre": R["unc"], "motivo": " ".join(dec["reasons"])[:200],
+                    "bloqueo": "+".join(b["id"] for b in R["blockers"]) if R["signal"] == "ESPERAR" else "",
+                    "cierre_utc": ctr.close_time.strftime("%Y-%m-%d %H:%M:%S"), "resultado": None, "acierto": None})
+    resolve_history(now)
+    if tcfg.mode == "live":
+        resolve_trades(now)
+    render_history()
+
+
+def render_live_legacy(cfg: Cfg, forced: Optional[str], tcfg: Optional[TradeCfg] = None) -> None:
     tcfg = tcfg or TradeCfg()
     R = analyze(cfg, forced)
     record_wait(R)
@@ -2850,9 +2940,9 @@ liquidez · incertidumbre. Los filtros no se relajan solos.
 # MAIN
 # ──────────────────────────────────────────────────────────────────────────────
 def main() -> None:
-    st.set_page_config(page_title="Kalshi BTC 15m · Analizador", page_icon="🟣", layout="centered",
+    st.set_page_config(page_title="Kalshi BTC 15m · Analizador", page_icon="🟣", layout="wide",
                        initial_sidebar_state="collapsed")
-    st.markdown(CSS, unsafe_allow_html=True)
+    st.markdown(CSS + edge_suite.CSS_EXTRA, unsafe_allow_html=True)
     init_state()
     st.markdown("### 🟣 Kalshi · BTC 15 min")
     st.caption("Solo BTC/USD · la operación automática está APAGADA por defecto. Ajustes: botón » arriba a la izquierda.")
@@ -2897,11 +2987,31 @@ def main() -> None:
             infl = st.slider("Inflación de volatilidad", 1.0, 1.5, 1.10, 0.05)
             use_bt = st.checkbox("Aplicar resultados del último backtest", True)
         with st.expander("⚡ Señal temprana", expanded=False):
-            early_on = st.checkbox("Emitir 1 señal por ventana de 15 min", True)
+            early_on = st.checkbox("Emitir 1 señal por ventana de 15 min", False,
+                                   help="Desactivada por defecto: una señal al inicio del contrato contradice la regla de no señalar solo porque empezó un contrato nuevo.")
             early_after = st.slider("Emitirla a los (s) del inicio", 10, 180, 30, 5)
             early_lock = st.checkbox("Mantener la dirección toda la ventana", True)
             early_drift = st.slider("Peso de la tendencia (σ)", 0.2, 1.0, 0.6, 0.05)
         chart_n = st.slider("Velas en la gráfica", 30, 240, 60, 10)
+        with st.expander("🧠 Análisis avanzado", expanded=False):
+            pos_l = st.radio("Posición abierta (Smart Exit Watch)",
+                             ["Ninguna", "Auto (de mi registro de órdenes reales)", "UP (YES)", "DOWN (NO)"], index=0,
+                             help="Solo para vigilar la posición con advertencias. La app NUNCA vende por ti.")
+            entry_c = st.number_input("Precio de entrada de la posición (¢, opcional)", 0.0, 99.0, 0.0, 1.0)
+            x_confirm = st.slider("Velas CERRADAS consecutivas para confirmar", 2, 4, 2)
+            x_win = st.slider("Velas cerradas mínimas dentro del contrato actual", 0, 5, 2,
+                              help="Evita señales solo porque empezó un contrato nuevo.")
+            x_adx = st.slider("ADX por debajo del cual el mercado es lateral", 12.0, 30.0, 20.0, 1.0)
+            x_block_chop = st.checkbox("Bloquear BUY en CHOP (mostrar WAIT)", True)
+            x_flip = st.checkbox("Bloquear entradas con Flip Risk ALTO", False)
+            x_maxp = st.slider("No comprar a partir de (¢)", 80, 99, 90)
+            st.session_state["xcfg"] = edge_suite.XCfg(
+                position={"Ninguna": "NONE", "Auto (de mi registro de órdenes reales)": "AUTO",
+                          "UP (YES)": "UP", "DOWN (NO)": "DOWN"}[pos_l],
+                entry_price=(entry_c / 100.0) if entry_c > 0 else None, confirm_n=x_confirm,
+                min_candles_in_window=x_win, adx_chop=x_adx, block_chop=x_block_chop,
+                block_high_flip=x_flip, max_entry_price=x_maxp / 100.0)
+
         st.divider()
         with st.expander("🤖 Operación automática", expanded=False):
             st.caption("Apagada por defecto. Claves solo por variables de entorno (KALSHI_API_KEY_ID, "
