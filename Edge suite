@@ -1,0 +1,1105 @@
+# -*- coding: utf-8 -*-
+"""
+edge_suite.py — Análisis avanzado para KALSHI EARLY SIGNAL BOT (BTC-USD · contratos KXBTC15M)
+===============================================================================================
+Módulo NUEVO, independiente de Streamlit en toda su lógica (Streamlit solo se importa dentro de las
+funciones render_*). Se conecta a app.py mediante `enhance(R, xcfg, lean_fn)`, que recibe el resultado de
+`analyze()` y le AÑADE:
+
+  1. Chart Analysis      EMA 9/21/50, RSI, MACD, momentum, ADX, ATR, tendencia BULLISH/BEARISH/NEUTRAL + explicación.
+  2. Smart Exit Watch    SAFE TO MONITOR / WARNING / STRONG EXIT WARNING (solo advertencias; nunca vende).
+  3. Flip Risk           índice heurístico 0–100 % de reversión + LOW/MEDIUM/HIGH + factores. NO es probabilidad calibrada.
+  4. Chop Detection      ADX + ATR + distancia entre EMA + cambios de dirección + cruces → CHOP bloquea BUY (muestra WAIT).
+  5. Entry Confirmation  solo velas de 1 min CERRADAS, 2 confirmaciones consecutivas, sin contradicciones,
+                         sin señales por el mero inicio de un contrato, sin entradas con precio ≥ 90¢.
+  6. Contract Analysis   compra/venta/spread/liquidez/último precio/implícita vs. técnica. Sin dato → DATA UNAVAILABLE.
+  7. Data Diagnostics    conexiones, última actualización, edad, nº de velas, confirmación de velas cerradas, errores.
+
+Reglas de diseño:
+  * TODO se calcula con velas cerradas (R["closed"]); la vela en formación solo se dibuja, nunca entra en un indicador.
+  * Todos los indicadores son causales (la fila t solo usa datos hasta t). `--selftest` lo comprueba.
+  * Los umbrales son heurísticos y NO están validados con backtest: se dice explícitamente en la interfaz.
+  * Nada de este módulo envía órdenes ni vende posiciones.
+
+Auto-pruebas (datos SINTÉTICOS, sin internet):   python edge_suite.py --selftest
+"""
+from __future__ import annotations
+
+import html as _html
+import math
+import sys
+import types
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+UNAVAILABLE = "DATA UNAVAILABLE"
+MIN_BARS = 60          # velas cerradas mínimas para que estos indicadores sean fiables
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CONFIGURACIÓN
+# ──────────────────────────────────────────────────────────────────────────────
+@dataclass
+class XCfg:
+    position: str = "NONE"                 # NONE | AUTO | UP | DOWN   (posición abierta para Smart Exit Watch)
+    entry_price: Optional[float] = None    # precio de entrada del contrato en dólares (0–1), opcional
+    confirm_n: int = 2                     # velas CERRADAS consecutivas que deben confirmar
+    min_candles_in_window: int = 2         # velas confirmatorias que deben haber cerrado DENTRO del contrato actual
+    max_opposing: int = 0                  # indicadores en contra tolerados (0 = ninguno)
+    adx_chop: float = 20.0                 # ADX por debajo del cual el mercado se considera sin tendencia
+    chop_points: int = 3                   # puntos de chop (de 7) a partir de los cuales es CHOP
+    block_chop: bool = True
+    max_entry_price: float = 0.90          # compra con precio >= esto queda bloqueada
+    rsi_ob: float = 70.0
+    rsi_os: float = 30.0
+    rsi_late_hi: float = 75.0              # BUY UP con RSI >= esto = entrada tardía
+    rsi_late_lo: float = 25.0              # BUY DOWN con RSI <= esto = entrada tardía
+    block_high_flip: bool = False
+    flip_med: float = 35.0
+    flip_high: float = 60.0
+
+
+def mkfilter(fid: str, name: str, status: str, value: str = "", limit: str = "", detail: str = "",
+             blocking: bool = True) -> dict:
+    """Mismo formato que mkf() de app.py: status ∈ ok | fail | warn | na."""
+    return {"id": fid, "name": name, "status": status, "value": value, "limit": limit,
+            "detail": detail, "blocking": blocking}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# INDICADORES (causales)
+# ──────────────────────────────────────────────────────────────────────────────
+VOTE_COLS = ["v_trend", "v_macd", "v_mom", "v_rsi", "v_px"]
+
+
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """Calcula indicadores sobre velas CERRADAS. La fila t solo usa filas ≤ t."""
+    d = df[["time", "open", "high", "low", "close", "volume"]].copy().reset_index(drop=True)
+    c, h, l = d["close"], d["high"], d["low"]
+    for n in (9, 21, 50):
+        d[f"ema{n}"] = c.ewm(span=n, adjust=False).mean()
+
+    delta = c.diff()
+    gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
+    rs = gain / loss.replace(0, np.nan)
+    rsi = 100 - 100 / (1 + rs)
+    rsi = rsi.where(~((loss == 0) & (gain > 0)), 100.0)
+    rsi = rsi.where(~((loss == 0) & (gain == 0)), 50.0)
+    d["rsi"] = rsi
+
+    e12, e26 = c.ewm(span=12, adjust=False).mean(), c.ewm(span=26, adjust=False).mean()
+    d["macd"] = e12 - e26
+    d["macd_signal"] = d["macd"].ewm(span=9, adjust=False).mean()
+    d["macd_hist"] = d["macd"] - d["macd_signal"]
+
+    prev = c.shift(1)
+    tr = pd.concat([h - l, (h - prev).abs(), (l - prev).abs()], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1 / 14, adjust=False).mean()
+    d["atr"] = atr
+
+    up, dn = h.diff(), -l.diff()
+    pdm = pd.Series(np.where((up > dn) & (up > 0), up, 0.0), index=d.index)
+    mdm = pd.Series(np.where((dn > up) & (dn > 0), dn, 0.0), index=d.index)
+    a = atr.replace(0, np.nan)
+    pdi = 100 * pdm.ewm(alpha=1 / 14, adjust=False).mean() / a
+    mdi = 100 * mdm.ewm(alpha=1 / 14, adjust=False).mean() / a
+    dx = (100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)).fillna(0.0)
+    d["plus_di"], d["minus_di"] = pdi, mdi
+    d["adx"] = dx.ewm(alpha=1 / 14, adjust=False).mean()
+
+    d["roc5"] = c / c.shift(5) - 1.0
+    d["roc10"] = c / c.shift(10) - 1.0
+    ret = np.log(c / c.shift(1))
+    ewma_var = (ret ** 2).ewm(alpha=0.06, adjust=False).mean()
+    roll_var = (ret ** 2).rolling(60, min_periods=30).mean()
+    d["sigma_ratio"] = np.sqrt(ewma_var / roll_var.replace(0, np.nan))
+
+    # Votos direccionales por vela (+1 alcista, −1 bajista, 0 neutral). Con banda muerta para no votar por ruido.
+    ab = atr.replace(0, np.nan)
+    d["v_trend"] = np.where((d["ema9"] > d["ema21"]) & (d["ema21"] > d["ema50"]), 1,
+                            np.where((d["ema9"] < d["ema21"]) & (d["ema21"] < d["ema50"]), -1, 0))
+    d["v_macd"] = np.where(d["macd_hist"] > 0.02 * ab, 1, np.where(d["macd_hist"] < -0.02 * ab, -1, 0))
+    mv = c - c.shift(5)
+    d["v_mom"] = np.where(mv > 0.25 * ab, 1, np.where(mv < -0.25 * ab, -1, 0))
+    d["v_rsi"] = np.where(rsi >= 52, 1, np.where(rsi <= 48, -1, 0))
+    pxd = c - d["ema21"]
+    d["v_px"] = np.where(pxd > 0.1 * ab, 1, np.where(pxd < -0.1 * ab, -1, 0))
+    V = d[VOTE_COLS].to_numpy()
+    d["n_pos"] = (V == 1).sum(axis=1)
+    d["n_neg"] = (V == -1).sum(axis=1)
+    return d
+
+
+def reading_series(d: pd.DataFrame, max_opp: int) -> np.ndarray:
+    """Dirección confirmada por vela: +1 / −1 si ≥ 3 de 5 indicadores la apoyan y no más de `max_opp` la contradicen."""
+    pos, neg = d["n_pos"].to_numpy(), d["n_neg"].to_numpy()
+    return np.where((pos >= 3) & (neg <= max_opp), 1, np.where((neg >= 3) & (pos <= max_opp), -1, 0))
+
+
+def trailing_streak(arr: np.ndarray) -> Tuple[int, int]:
+    """(dirección, nº de velas consecutivas) al final de la serie; (0, 0) si la última lectura es neutral."""
+    if len(arr) == 0 or arr[-1] == 0:
+        return 0, 0
+    s, n = arr[-1], 0
+    for v in arr[::-1]:
+        if v == s:
+            n += 1
+        else:
+            break
+    return int(s), n
+
+
+def btc_dir(side: Optional[str], ctr: Any) -> int:
+    """Dirección de BTC (+1/−1) que beneficia al lado comprado: UP=YES, DOWN=NO."""
+    if side not in ("UP", "DOWN"):
+        return 0
+    yes_above = True if ctr is None else bool(getattr(ctr, "yes_if_above", True))
+    return 1 if (side == "UP") == yes_above else -1
+
+
+def dir_word(dr: int) -> str:
+    return "ALCISTA" if dr > 0 else "BAJISTA" if dr < 0 else "NEUTRAL"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 1. CHART ANALYSIS
+# ──────────────────────────────────────────────────────────────────────────────
+def chart_analysis(d: pd.DataFrame, x: XCfg) -> dict:
+    r = d.iloc[-1]
+    px, atr = float(r["close"]), float(r["atr"])
+    pts, why = 0, []
+    if r["v_trend"] == 1:
+        pts += 2; why.append("EMA 9 > EMA 21 > EMA 50: estructura alcista completa (+2).")
+    elif r["v_trend"] == -1:
+        pts -= 2; why.append("EMA 9 < EMA 21 < EMA 50: estructura bajista completa (−2).")
+    elif r["ema9"] > r["ema21"]:
+        pts += 1; why.append("EMA 9 sobre EMA 21, pero sin alineación completa con la EMA 50 (+1).")
+    else:
+        pts -= 1; why.append("EMA 9 bajo EMA 21, pero sin alineación completa con la EMA 50 (−1).")
+    if r["v_px"] != 0:
+        pts += int(r["v_px"])
+        why.append(f"Precio {'sobre' if r['v_px'] > 0 else 'bajo'} la EMA 21 ({int(r['v_px']):+d}).")
+    if r["v_macd"] != 0:
+        pts += int(r["v_macd"])
+        why.append(f"Histograma MACD {'positivo' if r['v_macd'] > 0 else 'negativo'} ({int(r['v_macd']):+d}).")
+    if r["v_mom"] != 0:
+        pts += int(r["v_mom"])
+        why.append(f"Momentum de 5 velas {'al alza' if r['v_mom'] > 0 else 'a la baja'} ({int(r['v_mom']):+d}).")
+    if r["v_rsi"] != 0:
+        pts += int(r["v_rsi"])
+        why.append(f"RSI {r['rsi']:.0f} {'por encima de 52' if r['v_rsi'] > 0 else 'por debajo de 48'} ({int(r['v_rsi']):+d}).")
+    trend = "BULLISH" if pts >= 3 else "BEARISH" if pts <= -3 else "NEUTRAL"
+    if trend == "NEUTRAL":
+        why.append(f"Puntaje {pts:+d} de ±6: no alcanza ±3, así que no hay tendencia clara.")
+    else:
+        why.append(f"Puntaje {pts:+d} de ±6 → {trend}.")
+    rsi = float(r["rsi"])
+    rsi_state = ("OVERBOUGHT (sobrecompra)" if rsi >= x.rsi_ob else "OVERSOLD (sobreventa)" if rsi <= x.rsi_os
+                 else "cerca de sobrecompra" if rsi >= x.rsi_ob - 5 else "cerca de sobreventa" if rsi <= x.rsi_os + 5
+                 else "zona normal")
+    if rsi >= x.rsi_ob:
+        why.append(f"RSI {rsi:.0f} ≥ {x.rsi_ob:.0f}: sobrecompra; un alza adicional es más vulnerable a un giro.")
+    elif rsi <= x.rsi_os:
+        why.append(f"RSI {rsi:.0f} ≤ {x.rsi_os:.0f}: sobreventa; una baja adicional es más vulnerable a un giro.")
+    adx = float(r["adx"])
+    if adx < x.adx_chop:
+        why.append(f"ADX {adx:.0f} < {x.adx_chop:.0f}: la tendencia, si existe, es débil.")
+    h = d["macd_hist"].tail(3).to_numpy()
+    hist_trend = ("creciendo" if len(h) == 3 and h[2] > h[1] > h[0] else "cayendo" if len(h) == 3 and h[2] < h[1] < h[0]
+                  else "mixto")
+    return {"trend": trend, "score": pts, "why": why, "price": px, "ema9": float(r["ema9"]), "ema21": float(r["ema21"]),
+            "ema50": float(r["ema50"]), "rsi": rsi, "rsi_state": rsi_state, "macd": float(r["macd"]),
+            "macd_signal": float(r["macd_signal"]), "macd_hist": float(r["macd_hist"]), "hist_trend": hist_trend,
+            "roc5": float(r["roc5"]) if np.isfinite(r["roc5"]) else None,
+            "roc10": float(r["roc10"]) if np.isfinite(r["roc10"]) else None,
+            "adx": adx, "plus_di": float(r["plus_di"]), "minus_di": float(r["minus_di"]), "atr": atr,
+            "overbought": rsi >= x.rsi_ob, "oversold": rsi <= x.rsi_os,
+            "dir": 1 if trend == "BULLISH" else -1 if trend == "BEARISH" else 0}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 4. CHOP DETECTION
+# ──────────────────────────────────────────────────────────────────────────────
+def chop_analysis(d: pd.DataFrame, x: XCfg) -> dict:
+    r = d.iloc[-1]
+    atr, px = float(r["atr"]), float(r["close"])
+    adx = float(r["adx"])
+    emas = [float(r["ema9"]), float(r["ema21"]), float(r["ema50"])]
+    spread_atr = (max(emas) - min(emas)) / atr if atr > 0 else float("nan")
+    atr_ratio = atr / float(d["atr"].tail(60).mean()) if float(d["atr"].tail(60).mean()) > 0 else float("nan")
+    sg = np.sign(d["close"].diff().tail(13).to_numpy()[1:])
+    pairs = [(a, b) for a, b in zip(sg[:-1], sg[1:]) if a != 0 and b != 0]
+    flips = (sum(1 for a, b in pairs if a != b) / len(pairs)) if len(pairs) >= 6 else float("nan")
+    cs = np.sign((d["ema9"] - d["ema21"]).tail(21).to_numpy())
+    crosses = int(sum(1 for a, b in zip(cs[:-1], cs[1:]) if a != 0 and b != 0 and a != b))
+
+    pts, items = 0, []
+
+    def add(p: int, text: str) -> None:
+        nonlocal pts
+        pts += p
+        items.append((p, text))
+
+    if adx < x.adx_chop - 5:
+        add(2, f"ADX {adx:.0f} muy bajo (< {x.adx_chop - 5:.0f}): sin tendencia")
+    elif adx < x.adx_chop:
+        add(1, f"ADX {adx:.0f} bajo (< {x.adx_chop:.0f}): tendencia débil")
+    if np.isfinite(spread_atr):
+        if spread_atr < 0.6:
+            add(2, f"EMA 9/21/50 casi pegadas (separación {spread_atr:.2f} ATR)")
+        elif spread_atr < 1.2:
+            add(1, f"EMA 9/21/50 poco separadas ({spread_atr:.2f} ATR)")
+    if np.isfinite(atr_ratio) and atr_ratio < 0.75:
+        add(1, f"ATR comprimido ({atr_ratio:.2f}× su media de 60 velas)")
+    if np.isfinite(flips) and flips >= 0.70:
+        add(1, f"Cambios de dirección frecuentes ({flips * 100:.0f}% de las últimas velas alternan)")
+    if crosses >= 2:
+        add(1, f"{crosses} cruces EMA 9/21 en las últimas 20 velas")
+    state = "CHOP" if pts >= x.chop_points else "MIXED" if pts == x.chop_points - 1 else "TRENDING"
+    return {"state": state, "points": pts, "max_points": 7, "items": items, "adx": adx, "atr": atr,
+            "atr_pct": atr / px * 100 if px else float("nan"), "atr_ratio": atr_ratio, "spread_atr": spread_atr,
+            "flip_ratio": flips, "crosses": crosses}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 3. FLIP RISK (índice heurístico — NO probabilidad calibrada)
+# ──────────────────────────────────────────────────────────────────────────────
+def flip_risk(d: pd.DataFrame, x: XCfg, direction: int, chop: dict, z: Optional[float],
+              tau_min: Optional[float]) -> dict:
+    if direction == 0:
+        return {"available": False, "why": "No hay una dirección actual (ni señal ni tendencia clara) respecto a la cual medir una reversión."}
+    r = d.iloc[-1]
+    atr = float(r["atr"]) if r["atr"] > 0 else float("nan")
+    F: List[Tuple[float, str]] = []
+
+    h = (d["macd_hist"].tail(4) * direction).to_numpy()
+    if h[-1] <= 0:
+        F.append((20, "El histograma MACD ya va en contra de la dirección actual"))
+    elif len(h) == 4 and h[-1] < h[-2] < h[-3]:
+        F.append((12, "El histograma MACD se debilita 2 velas seguidas (momentum agotándose)"))
+    sp = (float(r["ema9"]) - float(r["ema21"])) * direction
+    if sp < 0:
+        F.append((15, "La EMA 9 cruzó en contra de la EMA 21"))
+    elif np.isfinite(atr) and sp < 0.3 * atr:
+        F.append((10, "EMA 9 y EMA 21 casi se tocan (cruce contrario inminente)"))
+    rsi = float(r["rsi"])
+    if (direction > 0 and rsi >= x.rsi_ob) or (direction < 0 and rsi <= x.rsi_os):
+        F.append((12, f"RSI {rsi:.0f} en zona {'de sobrecompra' if direction > 0 else 'de sobreventa'}: movimiento sobreextendido"))
+    elif (rsi - 50) * direction < 0:
+        F.append((8, f"RSI {rsi:.0f} del lado contrario a la dirección"))
+    adx = float(r["adx"])
+    if adx < 20:
+        F.append((10, f"ADX {adx:.0f}: tendencia débil, fácil de revertir"))
+    elif adx < 25:
+        F.append((5, f"ADX {adx:.0f}: tendencia moderada"))
+    if z is not None and np.isfinite(z):
+        fav = z * direction
+        if fav < 0:
+            F.append((15, "El precio está del lado contrario de la referencia del contrato"))
+        elif fav < 0.5:
+            F.append((12, f"El precio está muy cerca de la referencia (|z| = {abs(z):.2f})"))
+        elif fav < 1.0:
+            F.append((6, f"Colchón moderado sobre la referencia (z = {abs(z):.2f})"))
+    if tau_min is not None:
+        if tau_min > 10:
+            F.append((8, f"Quedan {tau_min:.0f} min: hay mucho tiempo para un giro"))
+        elif tau_min > 5:
+            F.append((4, f"Quedan {tau_min:.0f} min"))
+    sr = float(r["sigma_ratio"]) if np.isfinite(r["sigma_ratio"]) else None
+    if sr is not None:
+        if sr > 1.6:
+            F.append((8, f"Volatilidad reciente disparada (σ reciente/σ 60 min = {sr:.2f})"))
+        elif sr > 1.3:
+            F.append((4, f"Volatilidad reciente elevada ({sr:.2f}×)"))
+    if chop["points"] > 0:
+        F.append((min(10, 3 * chop["points"]), f"Señales de mercado lateral ({chop['points']}/7 puntos de chop)"))
+    opp = int(sum(1 for c_ in VOTE_COLS if r[c_] * direction == -1))
+    if opp:
+        F.append((min(12, 4 * opp), f"{opp} indicador(es) votan en contra de la dirección"))
+    risk = float(min(100.0, sum(p for p, _ in F)))
+    level = "HIGH" if risk > x.flip_high else "MEDIUM" if risk >= x.flip_med else "LOW"
+    F.sort(key=lambda t: -t[0])
+    return {"available": True, "risk": risk, "level": level, "factors": F, "dir": direction}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 2. SMART EXIT WATCH (solo advertencias)
+# ──────────────────────────────────────────────────────────────────────────────
+def exit_watch(d: pd.DataFrame, x: XCfg, pos_side: Optional[str], ctr: Any, q: dict, chart: dict,
+               confirm_dir: int, entry_price: Optional[float]) -> dict:
+    if pos_side not in ("UP", "DOWN"):
+        return {"state": "NONE", "points": 0, "reasons": [], "pos": None}
+    dr = btc_dir(pos_side, ctr)
+    r = d.iloc[-1]
+    atr = float(r["atr"])
+    R_: List[Tuple[int, str]] = []
+
+    h = (d["macd_hist"].tail(4) * dr).to_numpy()
+    if h[-1] <= 0:
+        R_.append((2, "Momentum en contra: el histograma MACD cambió de lado"))
+    elif len(h) == 4 and h[-1] < h[-2] < h[-3]:
+        R_.append((1, "Debilitamiento del momentum: el histograma MACD se achica 2 velas seguidas"))
+    if np.isfinite(r["roc5"]) and r["roc5"] * dr < 0:
+        R_.append((1, "El momentum de 5 velas ya apunta en contra de la posición"))
+
+    sp = (d["ema9"] - d["ema21"]).to_numpy() * dr
+    if sp[-1] < 0:
+        recent = bool(np.any(sp[-4:-1] >= 0))
+        R_.append((2, "Cruce contrario de EMA 9/21 " + ("(ocurrió en las últimas 3 velas)" if recent else "(vigente)")))
+
+    rsi_now, rsi_3 = float(r["rsi"]), float(d["rsi"].iloc[-4])
+    drsi = (rsi_now - rsi_3) * dr
+    if drsi <= -15:
+        R_.append((2, f"Cambio fuerte del RSI en contra ({rsi_3:.0f} → {rsi_now:.0f} en 3 velas)"))
+    elif drsi <= -8:
+        R_.append((1, f"Cambio importante del RSI en contra ({rsi_3:.0f} → {rsi_now:.0f} en 3 velas)"))
+    if (rsi_now - 50) * dr < 0:
+        R_.append((1, f"RSI {rsi_now:.0f} cruzó la línea de 50 en contra"))
+    elif (dr > 0 and rsi_3 >= x.rsi_ob > rsi_now) or (dr < 0 and rsi_3 <= x.rsi_os < rsi_now):
+        R_.append((1, "El RSI salió de la zona extrema a favor de la posición (agotamiento)"))
+
+    if chart["dir"] == -dr:
+        R_.append((2, f"Reversión de tendencia: el análisis técnico ahora es {chart['trend']}"))
+    elif chart["dir"] == 0:
+        R_.append((1, "La tendencia dejó de ser clara (NEUTRAL)"))
+
+    if confirm_dir == -dr:
+        R_.append((2, "La confirmación original se invirtió: las velas cerradas confirman la dirección contraria"))
+    elif confirm_dir == 0:
+        R_.append((1, "Se perdió la confirmación de la señal original (≥ 3 indicadores alineados y ninguno en contra)"))
+
+    bid = q.get("yes_bid") if pos_side == "UP" else q.get("no_bid")
+    pnl_txt = None
+    if entry_price and bid is not None:
+        pnl_txt = f"Valor de venta actual {bid * 100:.0f}¢ vs entrada {entry_price * 100:.0f}¢ ({(bid - entry_price) * 100:+.0f}¢ por contrato, antes de comisión)"
+        if bid <= entry_price - 0.10:
+            R_.append((1, f"El contrato perdió ≥ 10¢ desde tu entrada ({pnl_txt})"))
+    pts = sum(p for p, _ in R_)
+    cross_against = any("Cruce contrario" in t for _, t in R_)
+    trend_rev = any("Reversión de tendencia" in t for _, t in R_)
+    state = ("STRONG EXIT WARNING" if (pts >= 5 or (cross_against and trend_rev)) else
+             "WARNING" if pts >= 2 else "SAFE TO MONITOR")
+    return {"state": state, "points": pts, "reasons": R_, "pos": pos_side, "dir": dr, "pnl": pnl_txt,
+            "bid": bid}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 6. KALSHI CONTRACT ANALYSIS
+# ──────────────────────────────────────────────────────────────────────────────
+def contract_analysis(R: dict, chart: dict) -> dict:
+    mk, ctr, q = R.get("mk"), R.get("ctr"), R.get("q") or {}
+    if mk is None:
+        return {"available": False}
+    ya, yb, na, nb = q.get("yes_ask"), q.get("yes_bid"), q.get("no_ask"), q.get("no_bid")
+    sp_y = (ya - yb) if (ya is not None and yb is not None) else None
+    sp_n = (na - nb) if (na is not None and nb is not None) else None
+    implied = R.get("implied")
+    tech_yes = None
+    if chart is not None and chart["dir"] != 0 and ctr is not None:
+        yes_above = bool(ctr.yes_if_above)
+        tech_yes = "UP" if (chart["dir"] > 0) == yes_above else "DOWN"
+    mkt = None if implied is None else ("UP" if implied >= 0.55 else "DOWN" if implied <= 0.45 else "NEUTRAL")
+    if tech_yes is None or mkt is None:
+        align = "DATA UNAVAILABLE" if mkt is None else "técnica NEUTRAL"
+    elif mkt == "NEUTRAL":
+        align = "mercado indeciso (45–55 %)"
+    else:
+        align = "COINCIDEN" if tech_yes == mkt else "DIVERGEN"
+    return {"available": True, "yes_ask": ya, "yes_bid": yb, "no_ask": na, "no_bid": nb, "sp_yes": sp_y, "sp_no": sp_n,
+            "last": mk.get("last_price"), "implied": implied, "liquidity": mk.get("liquidity"),
+            "ask_size": mk.get("yes_ask_size"), "bid_size": mk.get("yes_bid_size"), "volume": mk.get("volume"),
+            "oi": mk.get("open_interest"), "tech_yes": tech_yes, "mkt": mkt, "align": align,
+            "p_model": R.get("p_final")}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 5. COMPUERTA DE ENTRADA (se aplica sobre la decisión de app.py)
+# ──────────────────────────────────────────────────────────────────────────────
+def build_gate(d: pd.DataFrame, x: XCfg, cand_side: Optional[str], ctr: Any, entry_ask: Optional[float],
+               chop: dict, flip: dict, readings: np.ndarray) -> Tuple[List[dict], dict]:
+    names = {"chop": "Mercado lateral (CHOP)", "confirm": f"Confirmación ({x.confirm_n} velas cerradas seguidas)",
+             "window": "Confirmación dentro del contrato actual", "contradiction": "Indicadores sin contradicciones",
+             "late": "Entrada no tardía (RSI)", "price90": f"Precio de compra < {x.max_entry_price * 100:.0f}¢",
+             "flip": "Flip Risk"}
+    if cand_side is None or ctr is None:
+        return [mkfilter(k, v, "na", blocking=False) for k, v in names.items()], {"dir": 0}
+    dr = btc_dir(cand_side, ctr)
+    r = d.iloc[-1]
+    F: List[dict] = []
+
+    # CHOP
+    if chop["state"] == "CHOP":
+        F.append(mkfilter("chop", names["chop"], "fail" if x.block_chop else "warn",
+                          f"{chop['points']}/7 pts · ADX {chop['adx']:.0f}", f"< {x.chop_points} pts",
+                          "Mercado lateral o sin dirección clara (" + "; ".join(t for _, t in chop["items"][:3]) + "). WAIT.",
+                          blocking=x.block_chop))
+    else:
+        F.append(mkfilter("chop", names["chop"], "ok", f"{chop['state']} · {chop['points']}/7 pts · ADX {chop['adx']:.0f}",
+                          f"< {x.chop_points} pts"))
+
+    # Confirmación consecutiva (solo velas CERRADAS)
+    n = x.confirm_n
+    tail = readings[-n:] if len(readings) >= n else np.array([])
+    ok_conf = len(tail) == n and bool(np.all(tail == dr))
+    cnt = trailing_streak(readings)
+    streak = cnt[1] if cnt[0] == dr else 0
+    sym = {1: "↑", -1: "↓", 0: "·"}
+    seq = " ".join(sym[int(v)] for v in readings[-4:])
+    F.append(mkfilter("confirm", names["confirm"], "ok" if ok_conf else "fail", f"{streak}/{n} · últimas: {seq}",
+                      f"{n} seguidas {'↑' if dr > 0 else '↓'}",
+                      "" if ok_conf else f"Solo {streak} de {n} velas CERRADAS consecutivas confirman la dirección "
+                      f"{dir_word(dr)}. Se espera confirmación antes de entrar (evita entradas tempranas)."))
+
+    # Ventana: las velas confirmatorias deben haber cerrado dentro del contrato actual
+    need = x.min_candles_in_window
+    ws = pd.Timestamp(ctr.window_start) if getattr(ctr, "window_start", None) is not None else None
+    if ws is None or need <= 0:
+        F.append(mkfilter("window", names["window"], "na", blocking=False))
+    else:
+        inside = int((d["time"] >= ws).sum())
+        w_ok = inside >= need
+        F.append(mkfilter("window", names["window"], "ok" if w_ok else "fail", f"{inside} velas cerradas dentro",
+                          f"≥ {need}",
+                          "" if w_ok else f"Solo {inside} vela(s) cerrada(s) desde que empezó este contrato: no se emite "
+                          "una señal solo porque comenzó un contrato nuevo."))
+
+    # Contradicción en la última vela cerrada
+    opp = [lab for lab, col in (("tendencia EMA", "v_trend"), ("MACD", "v_macd"), ("momentum", "v_mom"),
+                                ("RSI", "v_rsi"), ("precio vs EMA 21", "v_px")) if r[col] * dr == -1]
+    c_ok = len(opp) <= x.max_opposing
+    F.append(mkfilter("contradiction", names["contradiction"], "ok" if c_ok else "fail",
+                      f"{len(opp)} en contra" + (f" ({', '.join(opp)})" if opp else ""), f"≤ {x.max_opposing}",
+                      "" if c_ok else "Los indicadores se contradicen: " + ", ".join(opp) + " apuntan en contra de la señal."))
+
+    # Entrada tardía por RSI
+    rsi = float(r["rsi"])
+    late = (dr > 0 and rsi >= x.rsi_late_hi) or (dr < 0 and rsi <= x.rsi_late_lo)
+    F.append(mkfilter("late", names["late"], "fail" if late else "ok", f"RSI {rsi:.0f}",
+                      f"< {x.rsi_late_hi:.0f}" if dr > 0 else f"> {x.rsi_late_lo:.0f}",
+                      f"RSI {rsi:.0f}: el movimiento ya está muy extendido; entrar ahora es una entrada tardía." if late else ""))
+
+    # Precio ≥ 90¢
+    if entry_ask is None:
+        F.append(mkfilter("price90", names["price90"], "na", UNAVAILABLE, blocking=False))
+    else:
+        p_ok = entry_ask < x.max_entry_price - 1e-9
+        F.append(mkfilter("price90", names["price90"], "ok" if p_ok else "fail", f"{entry_ask * 100:.0f}¢",
+                          f"< {x.max_entry_price * 100:.0f}¢",
+                          "" if p_ok else f"El contrato cuesta {entry_ask * 100:.0f}¢ (≥ {x.max_entry_price * 100:.0f}¢): "
+                          "poco upside y mucho que perder; la entrada llegaría tarde."))
+
+    # Flip risk (opcional)
+    if x.block_high_flip and flip.get("available") and flip["level"] == "HIGH":
+        F.append(mkfilter("flip", names["flip"], "fail", f"{flip['risk']:.0f}% HIGH", f"≤ {x.flip_high:.0f}%",
+                          f"Riesgo de reversión ALTO ({flip['risk']:.0f}%): " + "; ".join(t for _, t in flip["factors"][:2]) + "."))
+    elif flip.get("available"):
+        F.append(mkfilter("flip", names["flip"], "ok" if flip["level"] != "HIGH" else "warn",
+                          f"{flip['risk']:.0f}% {flip['level']}", "informativo", "", blocking=False))
+    else:
+        F.append(mkfilter("flip", names["flip"], "na", blocking=False))
+    return F, {"dir": dr, "ok_conf": ok_conf, "streak": streak}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PUNTO DE ENTRADA: enriquece el resultado de analyze()
+# ──────────────────────────────────────────────────────────────────────────────
+def enhance(R: dict, x: XCfg, lean_fn: Callable[[Optional[float], dict], Optional[dict]],
+            auto_position: Optional[str] = None) -> dict:
+    """Añade R['X'] y aplica la compuerta de entrada a R['dec']. NO envía órdenes."""
+    closed, ctr = R.get("closed"), R.get("ctr")
+    X: Dict[str, Any] = {"ok": False, "why": ""}
+    R["X"] = X
+    if closed is None or len(closed) < MIN_BARS:
+        X["why"] = (f"Se necesitan ≥ {MIN_BARS} velas cerradas de 1 min para el análisis avanzado "
+                    f"(hay {0 if closed is None else len(closed)}).")
+        return R
+    d = add_indicators(closed)
+    if not np.isfinite(d["adx"].iloc[-1]) or not np.isfinite(d["rsi"].iloc[-1]) or not d["atr"].iloc[-1] > 0:
+        X["why"] = "Indicadores aún no válidos (NaN)."
+        return R
+    chart = chart_analysis(d, x)
+    chop = chop_analysis(d, x)
+    readings = reading_series(d, x.max_opposing)
+    conf_dir, conf_n = trailing_streak(readings)
+
+    dec = R["dec"]
+    was_buy = str(dec.get("signal", "")).startswith("BUY")
+    lean = R.get("lean")
+    cand_side = dec.get("side") if was_buy else (lean["side"] if lean else None)
+    entry_ask = None
+    if cand_side and (dec.get("sides") or {}).get(cand_side):
+        entry_ask = dec["sides"][cand_side]["ask"]
+    mp = R.get("mp")
+    z = None if mp is None else float(mp["z"])
+    flip_dir = btc_dir(cand_side, ctr) if cand_side else chart["dir"]
+    flip = flip_risk(d, x, flip_dir, chop, z, R.get("tau_min"))
+    if flip.get("available"):
+        flip["dir_txt"] = (f"señal {dec['signal']}" if was_buy else f"inclinación {cand_side}" if cand_side
+                           else f"tendencia {chart['trend']}")
+        flip["p_opp_model"] = None if (R.get("p_final") is None or cand_side is None) else \
+            (1 - R["p_final"]) if cand_side == "UP" else R["p_final"]
+
+    gate, gmeta = build_gate(d, x, cand_side, ctr, entry_ask, chop, flip, readings)
+    fails = [f for f in gate if f["status"] == "fail" and f["blocking"]]
+    dec["filters"] = list(dec["filters"]) + gate
+    R["filters"] = list(R["filters"]) + gate
+    downgraded = False
+    if was_buy and fails:
+        dec["signal"], dec["side"] = "ESPERAR", None
+        dec["reasons"] = [f["detail"] for f in fails if f["detail"]] or ["Bloqueado por la compuerta de entrada."]
+        downgraded = True
+    R["signal"] = dec["signal"]
+    R["blockers"] = [f for f in R["filters"] if f["status"] == "fail" and f["blocking"]]
+    R["lean"] = lean_fn(R.get("p_final"), dec)
+
+    pos = x.position
+    if pos == "AUTO":
+        pos = auto_position or "NONE"
+    pos_side = pos if pos in ("UP", "DOWN") else None
+    ex = exit_watch(d, x, pos_side, ctr, R.get("q") or {}, chart, conf_dir, x.entry_price)
+    ex["auto"] = (x.position == "AUTO")
+    cont = contract_analysis(R, chart)
+    X.update({"ok": True, "d": d, "chart": chart, "chop": chop, "flip": flip, "exit": ex, "contract": cont,
+              "gate": gate, "gate_meta": gmeta, "readings": readings, "conf_dir": conf_dir, "conf_n": conf_n,
+              "cand_side": cand_side, "downgraded": downgraded, "was_buy": was_buy, "xcfg": x})
+    return R
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# UI (Streamlit se importa solo aquí dentro)
+# ──────────────────────────────────────────────────────────────────────────────
+CSS_EXTRA = """
+<style>
+.stApp {background:#080c14 !important;}
+section[data-testid="stSidebar"] {background:#0c1220 !important;border-right:1px solid #1b2740 !important;}
+.block-container {max-width:1320px !important;padding-top:.8rem !important;}
+h1,h2,h3,h4,h5 {color:#e6edf7 !important;}
+.st-key-dash [data-testid="stHorizontalBlock"] {flex-wrap:wrap !important;}
+.st-key-dash [data-testid="stHorizontalBlock"] > [data-testid="stColumn"],
+.st-key-dash [data-testid="stHorizontalBlock"] > [data-testid="column"] {min-width:310px !important;flex:1 1 310px !important;}
+.xcard {background:#0f1626;border:1px solid #1f2d4a;border-radius:14px;padding:.7rem .85rem;margin:.45rem 0;
+        box-shadow:0 2px 14px rgba(0,0,0,.35);}
+.xcard.bull {border-color:#16a34a;} .xcard.bear {border-color:#dc2626;} .xcard.warn {border-color:#d97706;}
+.xt {color:#7f93b8;font-size:.68rem;letter-spacing:.16em;text-transform:uppercase;margin-bottom:.35rem;font-weight:600;}
+.xbig {font-size:2.1rem;font-weight:800;line-height:1.05;display:inline-block;margin-right:.5rem;}
+.xbig.bull,.xv.bull {color:#22c55e;} .xbig.bear,.xv.bear {color:#ef4444;} .xbig.warn,.xv.warn {color:#f59e0b;}
+.xbig.neutral,.xv.neutral {color:#94a3b8;}
+.xb {display:inline-block;padding:2px 10px;border-radius:999px;font-size:.72rem;font-weight:700;letter-spacing:.04em;}
+.xb.bull {background:#052e16;color:#4ade80;border:1px solid #16a34a;}
+.xb.bear {background:#3b0a0a;color:#f87171;border:1px solid #dc2626;}
+.xb.warn {background:#3a2605;color:#fbbf24;border:1px solid #d97706;}
+.xb.neutral {background:#162033;color:#a5b4cf;border:1px solid #2b3d61;}
+.xbar {height:8px;border-radius:6px;background:#162033;margin:.5rem 0;overflow:hidden;}
+.xbar > div {height:100%;border-radius:6px;}
+.xm {color:#8fa3c7;font-size:.78rem;} .xn {color:#8fa3c7;font-size:.78rem;line-height:1.35;margin-top:.35rem;}
+.xl {color:#cbd6ec;font-size:.8rem;line-height:1.38;margin:.18rem 0;}
+.xl b {color:#fff;}
+table.xkv {width:100%;border-collapse:collapse;font-size:.79rem;}
+table.xkv td {padding:3px 4px;border-bottom:1px solid #18243e;vertical-align:top;}
+table.xkv td.k {color:#7f93b8;width:46%;} table.xkv td.v {text-align:right;color:#e6edf7;word-break:break-word;}
+.xdot {display:inline-block;width:.62rem;height:.62rem;border-radius:50%;margin-right:.35rem;}
+.xdot.bull {background:#22c55e;box-shadow:0 0 7px #22c55e;} .xdot.bear {background:#ef4444;box-shadow:0 0 7px #ef4444;}
+.xdot.warn {background:#f59e0b;box-shadow:0 0 7px #f59e0b;} .xdot.neutral {background:#64748b;}
+.xtop {display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;margin:.1rem 0 .3rem;}
+.xtop .ttl {font-size:1.25rem;font-weight:800;color:#e6edf7;margin-right:.6rem;}
+</style>
+"""
+
+
+def esc(x: Any) -> str:
+    return _html.escape(str(x)).replace("$", "&#36;")
+
+
+def _badge(text: str, kind: str) -> str:
+    return f"<span class='xb {kind}'>{esc(text)}</span>"
+
+
+def _card(title: str, body: str, tone: str = "") -> str:
+    return f"<div class='xcard {tone}'><div class='xt'>{esc(title)}</div>{body}</div>"
+
+
+def _kv(rows: List[Tuple[str, Any]]) -> str:
+    return "<table class='xkv'>" + "".join(
+        f"<tr><td class='k'>{esc(k)}</td><td class='v'>{v if isinstance(v, _Raw) else esc(v)}</td></tr>" for k, v in rows) + "</table>"
+
+
+class _Raw(str):
+    """Texto HTML ya construido (no se escapa)."""
+
+
+def _f(x: Any, nd: int = 2, pre: str = "", suf: str = "") -> str:
+    try:
+        if x is None or not np.isfinite(float(x)):
+            return UNAVAILABLE
+        return f"{pre}{float(x):,.{nd}f}{suf}"
+    except (TypeError, ValueError):
+        return UNAVAILABLE
+
+
+def _c(x: Optional[float]) -> str:
+    if x is None:
+        return UNAVAILABLE
+    v = x * 100
+    return f"{v:.0f}¢" if abs(v - round(v)) < 0.05 else f"{v:.1f}¢"
+
+
+def _p(x: Optional[float]) -> str:
+    return UNAVAILABLE if x is None or not np.isfinite(x) else f"{x * 100:.1f}%"
+
+
+def _t(dt: Optional[datetime], tz: Any, fmt: str = "%H:%M:%S") -> str:
+    return UNAVAILABLE if dt is None else dt.astimezone(tz).strftime(fmt)
+
+
+def _md(html: str) -> None:
+    import streamlit as st
+    st.markdown(html, unsafe_allow_html=True)
+
+
+TREND_KIND = {"BULLISH": "bull", "BEARISH": "bear", "NEUTRAL": "neutral"}
+
+
+def render_topbar(R: dict, tz: Any) -> None:
+    import streamlit as st
+    stt = st.session_state.get("status", {})
+    X, ctr, tau = R.get("X", {}), R.get("ctr"), R.get("tau_min")
+
+    def chip(name: str, label: str) -> str:
+        s = stt.get(name)
+        if not s:
+            return _badge(f"{label} · sin datos", "neutral")
+        return _badge(f"{label} · OK" if s["ok"] else f"{label} · ERROR", "bull" if s["ok"] else "bear")
+    lv = R["fresh"]["level"]
+    fresh = _badge({"green": "Datos frescos", "yellow": "Datos con retraso", "red": "Datos obsoletos"}[lv],
+                   {"green": "bull", "yellow": "warn", "red": "bear"}[lv])
+    trend = ""
+    if X.get("ok"):
+        t = X["chart"]["trend"]
+        trend = _badge(f"BTC {t}", TREND_KIND[t])
+    cont = ""
+    if ctr is not None and tau is not None:
+        cont = f"<span class='xm'>{esc(ctr.ticker)} · cierra en {max(int(tau * 60), 0) // 60:02d}:{max(int(tau * 60), 0) % 60:02d}</span>"
+    _md("<div class='xtop'><span class='ttl'>🟣 Kalshi · BTC 15 min</span>" + chip("Coinbase · velas 1m", "Coinbase")
+        + chip("Kalshi · mercados", "Kalshi") + fresh + trend + cont + "</div>")
+
+
+def _unavailable(title: str, X: dict) -> None:
+    _md(_card(title, f"<div class='xn'>{esc(X.get('why') or 'Sin datos suficientes.')}</div>"))
+
+
+def render_flip(X: dict) -> None:
+    if not X.get("ok"):
+        return _unavailable("Flip Risk", X)
+    fr = X["flip"]
+    if not fr["available"]:
+        return _md(_card("Flip Risk", f"<div class='xn'>{esc(fr['why'])}</div>"))
+    kind = {"LOW": "bull", "MEDIUM": "warn", "HIGH": "bear"}[fr["level"]]
+    col = {"bull": "#22c55e", "warn": "#f59e0b", "bear": "#ef4444"}[kind]
+    fac = "".join(f"<div class='xl'>▸ {esc(t)} <span class='xm'>(+{p:.0f})</span></div>" for p, t in fr["factors"][:6]) \
+        or "<div class='xl'>Sin factores de riesgo relevantes ahora mismo.</div>"
+    model = ""
+    if fr.get("p_opp_model") is not None:
+        model = (f"<div class='xn'>Referencia: el modelo estadístico de la app da {_p(fr['p_opp_model'])} al lado contrario "
+                 "(también sin calibrar salvo que el backtest lo valide).</div>")
+    _md(_card("Flip Risk · riesgo de reversión",
+              f"<span class='xbig {kind}'>{fr['risk']:.0f}%</span>{_badge(fr['level'], kind)}"
+              f"<div class='xm'>contra la dirección de la {esc(fr['dir_txt'])}</div>"
+              f"<div class='xbar'><div style='width:{fr['risk']:.0f}%;background:{col}'></div></div>{fac}{model}"
+              "<div class='xn'>⚠ Índice heurístico 0–100, <b>no</b> una probabilidad estadística calibrada: no ha sido "
+              "validado con datos históricos.</div>", kind if kind != "bull" else ""))
+
+
+def render_chop(X: dict) -> None:
+    if not X.get("ok"):
+        return _unavailable("Chop Detection", X)
+    ch = X["chop"]
+    kind = {"CHOP": "warn", "MIXED": "neutral", "TRENDING": "bull"}[ch["state"]]
+    items = "".join(f"<div class='xl'>▸ {esc(t)} <span class='xm'>(+{p})</span></div>" for p, t in ch["items"]) \
+        or "<div class='xl'>Ningún indicio de mercado lateral.</div>"
+    txt = {"CHOP": "Mercado lateral: se evitan BUY UP / BUY DOWN → WAIT.", "MIXED": "Zona gris: vigilar.",
+           "TRENDING": "Hay dirección suficiente para operar."}[ch["state"]]
+    _md(_card("Chop Detection",
+              f"{_badge(ch['state'], kind)} <span class='xm'>{ch['points']}/7 puntos · umbral {X['xcfg'].chop_points}</span>"
+              f"<div class='xl' style='margin-top:.35rem'><b>{esc(txt)}</b></div>{items}"
+              + _kv([("ADX 14", _f(ch["adx"], 1)), ("ATR 14", _f(ch["atr"], 2, "$") + f" ({_f(ch['atr_pct'], 3, '', '%')})"),
+                     ("ATR vs media 60", _f(ch["atr_ratio"], 2, "", "×")),
+                     ("Separación EMA 9/21/50", _f(ch["spread_atr"], 2, "", " ATR")),
+                     ("Alternancia de velas", _p(ch["flip_ratio"])), ("Cruces EMA 9/21 (20 velas)", ch["crosses"])]),
+              "warn" if ch["state"] == "CHOP" else ""))
+
+
+def render_exit(X: dict) -> None:
+    if not X.get("ok"):
+        return _unavailable("Smart Exit Watch", X)
+    ex = X["exit"]
+    if ex["state"] == "NONE":
+        return _md(_card("Smart Exit Watch",
+                         f"{_badge('SIN POSICIÓN', 'neutral')}<div class='xn'>Indica tu posición abierta (UP/YES o DOWN/NO) en la "
+                         "barra lateral → «🧠 Análisis avanzado» para vigilar si pierde su ventaja. "
+                         "Solo emite advertencias: <b>nunca vende por ti</b>.</div>"))
+    kind = {"SAFE TO MONITOR": "bull", "WARNING": "warn", "STRONG EXIT WARNING": "bear"}[ex["state"]]
+    rs = "".join(f"<div class='xl'>▸ {esc(t)} <span class='xm'>(+{p})</span></div>" for p, t in ex["reasons"]) \
+        or "<div class='xl'>Sin señales de pérdida de ventaja en las velas cerradas.</div>"
+    pnl = f"<div class='xn'>{esc(ex['pnl'])}</div>" if ex.get("pnl") else ""
+    _md(_card("Smart Exit Watch",
+              f"<span class='xbig {kind}' style='font-size:1.45rem'>{esc(ex['state'])}</span>"
+              f"<div class='xm'>Posición {'UP (YES)' if ex['pos'] == 'UP' else 'DOWN (NO)'}"
+              f"{' · detectada de tu registro de órdenes' if ex.get('auto') else ''} · {ex['points']} pts</div>{rs}{pnl}"
+              "<div class='xn'>Advertencia informativa basada en velas cerradas; no ejecuta ventas ni garantiza resultados. "
+              "«SAFE TO MONITOR» no significa «sin riesgo».</div>", kind if kind != "bull" else ""))
+
+
+def render_confirmation(X: dict) -> None:
+    if not X.get("ok"):
+        return _unavailable("Entry Confirmation", X)
+    ids = ("confirm", "window", "contradiction", "chop", "late", "price90")
+    G = {f["id"]: f for f in X["gate"]}
+    rows = ""
+    for i in ids:
+        f = G.get(i)
+        if f is None:
+            continue
+        kind = {"ok": "bull", "fail": "bear", "warn": "warn", "na": "neutral"}[f["status"]]
+        rows += (f"<div class='xl'><span class='xdot {kind}'></span><b>{esc(f['name'])}</b> "
+                 f"<span class='xm'>{esc(f['value'])}</span></div>")
+    sym = {1: "↑", -1: "↓", 0: "·"}
+    seq = " ".join(sym[int(v)] for v in X["readings"][-6:])
+    state = ("Hay una oportunidad confirmada" if all(f["status"] != "fail" for f in X["gate"] if f["blocking"])
+             and X["cand_side"] else "WAIT: sin oportunidad suficientemente confirmada")
+    _md(_card("Entry Confirmation · solo velas de 1 min cerradas",
+              f"<div class='xl'><b>{esc(state)}</b></div>{rows}"
+              f"<div class='xn'>Lecturas de las últimas velas cerradas: <b>{esc(seq)}</b> (↑ alcista · ↓ bajista · · sin consenso). "
+              "Una lectura exige ≥ 3 de 5 indicadores alineados y ninguno en contra.</div>"))
+
+
+def render_chart_analysis(X: dict) -> None:
+    if not X.get("ok"):
+        return _unavailable("Chart Analysis", X)
+    c = X["chart"]
+    rsi_kind = "bear" if c["overbought"] else "bull" if c["oversold"] else "neutral"
+    why = "".join(f"<div class='xl'>▸ {esc(t)}</div>" for t in c["why"])
+    roc = _f(None if c["roc5"] is None else c["roc5"] * 100, 3, "", "%")
+    _md(_card("Chart Analysis",
+              f"<span class='xbig {TREND_KIND[c['trend']]}' style='font-size:1.6rem'>{c['trend']}</span>"
+              f"<span class='xm'>puntaje {c['score']:+d} / ±6</span>"
+              + _kv([("EMA 9 / 21 / 50", f"{_f(c['ema9'], 0, '$')} / {_f(c['ema21'], 0, '$')} / {_f(c['ema50'], 0, '$')}"),
+                     ("RSI 14", _Raw(f"{c['rsi']:.1f} {_badge(c['rsi_state'], rsi_kind)}")),
+                     ("MACD / señal", f"{_f(c['macd'], 2)} / {_f(c['macd_signal'], 2)}"),
+                     ("Histograma MACD", f"{_f(c['macd_hist'], 2)} ({c['hist_trend']})"),
+                     ("Momentum (5 velas)", roc),
+                     ("ADX · +DI / −DI", f"{c['adx']:.1f} · {c['plus_di']:.0f} / {c['minus_di']:.0f}"),
+                     ("ATR 14", _f(c["atr"], 2, "$"))])
+              + f"<div class='xt' style='margin-top:.6rem'>Por qué</div>{why}", TREND_KIND[c["trend"]] if c["trend"] != "NEUTRAL" else ""))
+
+
+def render_contract(X: dict) -> None:
+    if not X.get("ok"):
+        return _unavailable("Kalshi Contract Analysis", X)
+    k = X["contract"]
+    if not k["available"]:
+        return _md(_card("Kalshi Contract Analysis", f"<div class='xv warn'>{UNAVAILABLE}</div>"
+                         "<div class='xn'>No hay contrato de Kalshi seleccionado ahora mismo. No se inventan cotizaciones.</div>"))
+    al = k["align"]
+    ak = "bull" if al == "COINCIDEN" else "bear" if al == "DIVERGEN" else "neutral"
+    word = {"UP": "UP (YES)", "DOWN": "DOWN (NO)", None: UNAVAILABLE, "NEUTRAL": "NEUTRAL"}
+    liq = _f(k["liquidity"], 2, "$") if k["liquidity"] is not None else UNAVAILABLE
+    _md(_card("Kalshi Contract Analysis",
+              _kv([("YES compra / venta", f"{_c(k['yes_ask'])} / {_c(k['yes_bid'])}"),
+                   ("NO compra / venta", f"{_c(k['no_ask'])} / {_c(k['no_bid'])}"),
+                   ("Spread YES / NO", f"{_c(k['sp_yes'])} / {_c(k['sp_no'])}"),
+                   ("Precio actual (último operado)", _c(k["last"])),
+                   ("Prob. implícita YES (punto medio)", _p(k["implied"])),
+                   ("Liquidez del mercado", liq),
+                   ("Contratos a la compra YES / venta YES", f"{_f(k['ask_size'], 0)} / {_f(k['bid_size'], 0)}"),
+                   ("Volumen · interés abierto", f"{_f(k['volume'], 0)} · {_f(k['oi'], 0)}"),
+                   ("Señal técnica (en YES/NO)", word.get(k["tech_yes"], UNAVAILABLE)),
+                   ("Dirección que cotiza el mercado", word.get(k["mkt"], UNAVAILABLE)),
+                   ("Técnica vs mercado", _Raw(_badge(al, ak))),
+                   ("Modelo vs mercado", "—" if (k["p_model"] is None or k["implied"] is None)
+                    else f"{(k['p_model'] - k['implied']) * 100:+.1f} pts")])
+              + "<div class='xn'>Cualquier campo que Kalshi no entregó se muestra como DATA UNAVAILABLE; "
+                "nunca se estima ni se rellena.</div>"))
+
+
+def render_data_diagnostics(R: dict, cfg: Any, tz: Any) -> None:
+    import streamlit as st
+    stt = st.session_state.get("status", {})
+    now, cand, closed = R["now"], R.get("cand"), R.get("closed")
+    rows = ""
+    for name, lab in (("Coinbase · precio", "Coinbase precio"), ("Coinbase · velas 1m", "Coinbase velas"),
+                      ("Kalshi · mercados", "Kalshi")):
+        s = stt.get(name)
+        if not s:
+            rows += f"<tr><td>{lab}</td><td>{_badge('SIN DATOS', 'neutral')}</td><td>—</td><td>—</td><td>—</td></tr>"
+            continue
+        age = None if s.get("ok_at") is None else (now - s["ok_at"]).total_seconds()
+        st_ = _badge("OK", "bull") if s["ok"] else _badge(f"ERROR ×{s.get('fails', 1)}", "bear")
+        rows += (f"<tr><td>{lab}</td><td>{st_}</td><td>{_t(s.get('ok_at'), tz)}</td>"
+                 f"<td>{_f(age, 0, '', ' s')}</td><td>{_f(s.get('latency_ms'), 0, '', ' ms')}</td></tr>")
+    table = ("<table class='xkv'><tr><td class='k'>Fuente</td><td class='k'>Estado</td><td class='k'>Última OK</td>"
+             "<td class='k'>Edad</td><td class='k'>Latencia</td></tr>" + rows + "</table>")
+    info: List[Tuple[str, Any]] = [("Última actualización de pantalla", f"{_t(now, tz)} (#{R['data_log']['refresh_n']})")]
+    closed_ok = None
+    if closed is not None and len(closed):
+        last_start = closed["time"].iloc[-1].to_pydatetime()
+        end = last_start + timedelta(seconds=60)
+        closed_ok = end <= now
+        info += [("Edad de la última vela cerrada", f"{max((now - end).total_seconds(), 0):.0f} s (máx. {cfg.candle_max_s} s)"),
+                 ("Última vela cerrada (inicio → cierre)", f"{_t(last_start, tz, '%H:%M')} → {_t(end, tz, '%H:%M:%S')}")]
+    else:
+        info.append(("Edad de la última vela cerrada", UNAVAILABLE))
+    raw_n = 0 if cand is None else len(cand["df"])
+    info.append(("Velas recibidas de Coinbase", f"{raw_n}" if cand is not None else UNAVAILABLE))
+    info.append(("Velas cerradas usadas en indicadores", f"{0 if closed is None else len(closed)}"
+                 + (f" · {R['n_gap']} huecos internos rellenados planos" if R.get("n_gap") else "")))
+    info.append(("Vela en formación", "1 (solo dibujada; EXCLUIDA de todo cálculo)" if R.get("forming") is not None
+                 else "ninguna recibida (no afecta)"))
+    info.append(("¿Todas las velas usadas están cerradas?",
+                 _Raw(_badge("SÍ · verificado", "bull") if closed_ok else _badge("NO / sin datos", "bear") if closed_ok is False
+                      else _badge(UNAVAILABLE, "neutral"))))
+    if cand is not None:
+        info.append(("Fuente de las velas", cand.get("source", UNAVAILABLE)))
+    errs: List[str] = []
+    for name, s in stt.items():
+        if s and not s.get("ok") and s.get("error"):
+            errs.append(f"{name}: {s['error']}")
+    if cand is not None:
+        for a in cand.get("attempts", []):
+            if not a["ok"]:
+                errs.append(f"{a['source']}: {a['error']}")
+    err_html = "".join(f"<div class='xl' style='color:#fca5a5'>• {esc(e)}</div>" for e in errs) \
+        or "<div class='xl' style='color:#86efac'>Sin errores de conexión ni de API en este momento.</div>"
+    _md(_card("Data Diagnostics", table + _kv(info) + f"<div class='xt' style='margin-top:.55rem'>Errores</div>{err_html}"))
+
+
+def make_chart(X: dict, forming: Any, ctr: Any, minutes: int, tz: Any):
+    """Gráfico de BTC: velas + EMA 9/21/50 + referencia · RSI · MACD · momentum · ADX. Solo velas cerradas (+ la vela
+    en formación dibujada aparte, sin indicadores)."""
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    d = X["d"].tail(minutes).copy()
+    loc_ = lambda s: pd.to_datetime(s, utc=True).dt.tz_convert(tz).dt.tz_localize(None)
+    xs = loc_(d["time"])
+    fig = make_subplots(rows=5, cols=1, shared_xaxes=True, vertical_spacing=0.02,
+                        row_heights=[0.44, 0.13, 0.15, 0.14, 0.14])
+    fig.add_trace(go.Candlestick(x=xs, open=d["open"], high=d["high"], low=d["low"], close=d["close"], name="BTC-USD 1m",
+                                 increasing_line_color="#22c55e", decreasing_line_color="#ef4444"), row=1, col=1)
+    if forming is not None:
+        fx = pd.Timestamp(forming["time"]).tz_convert(tz).tz_localize(None)
+        fig.add_trace(go.Candlestick(x=[fx], open=[forming["open"]], high=[forming["high"]], low=[forming["low"]],
+                                     close=[forming["close"]], name="En formación (no se usa)",
+                                     increasing_line_color="#94a3b8", decreasing_line_color="#94a3b8",
+                                     increasing_fillcolor="rgba(0,0,0,0)", decreasing_fillcolor="rgba(0,0,0,0)"), row=1, col=1)
+    for n, col in ((9, "#38bdf8"), (21, "#f59e0b"), (50, "#c084fc")):
+        fig.add_trace(go.Scatter(x=xs, y=d[f"ema{n}"], name=f"EMA {n}", line=dict(color=col, width=1.3)), row=1, col=1)
+    if ctr is not None and getattr(ctr, "reference", None) is not None:
+        fig.add_hline(y=ctr.reference, line=dict(color="#facc15", dash="dash", width=1), row=1, col=1,
+                      annotation_text="Referencia", annotation_position="top left")
+    fig.add_trace(go.Scatter(x=xs, y=d["rsi"], name="RSI 14", line=dict(color="#a5b4fc", width=1.3)), row=2, col=1)
+    fig.add_hline(y=70, line=dict(color="#ef4444", dash="dot", width=1), row=2, col=1)
+    fig.add_hline(y=30, line=dict(color="#22c55e", dash="dot", width=1), row=2, col=1)
+    colors = np.where(d["macd_hist"] >= 0, "#22c55e", "#ef4444")
+    fig.add_trace(go.Bar(x=xs, y=d["macd_hist"], name="MACD hist", marker_color=list(colors)), row=3, col=1)
+    fig.add_trace(go.Scatter(x=xs, y=d["macd"], name="MACD", line=dict(color="#38bdf8", width=1.1)), row=3, col=1)
+    fig.add_trace(go.Scatter(x=xs, y=d["macd_signal"], name="Señal", line=dict(color="#f59e0b", width=1.1)), row=3, col=1)
+    fig.add_trace(go.Scatter(x=xs, y=d["roc5"] * 100, name="Momentum 5 (%)", line=dict(color="#2dd4bf", width=1.3)), row=4, col=1)
+    fig.add_hline(y=0, line=dict(color="#475569", width=1), row=4, col=1)
+    fig.add_trace(go.Scatter(x=xs, y=d["adx"], name="ADX", line=dict(color="#fbbf24", width=1.3)), row=5, col=1)
+    fig.add_trace(go.Scatter(x=xs, y=d["plus_di"], name="+DI", line=dict(color="#22c55e", width=1)), row=5, col=1)
+    fig.add_trace(go.Scatter(x=xs, y=d["minus_di"], name="−DI", line=dict(color="#ef4444", width=1)), row=5, col=1)
+    fig.add_hline(y=20, line=dict(color="#64748b", dash="dot", width=1), row=5, col=1)
+    if ctr is not None:
+        for t0 in (ctr.window_start, ctr.close_time):
+            tx = pd.Timestamp(t0).tz_convert(tz).tz_localize(None)
+            if xs.iloc[0] <= tx <= xs.iloc[-1] + pd.Timedelta(minutes=16):
+                fig.add_shape(type="line", x0=tx, x1=tx, y0=0, y1=1, xref="x", yref="paper",
+                              line=dict(color="#7f93b8", dash="dot", width=1))
+    for r_, t_ in ((2, "RSI"), (3, "MACD"), (4, "Mom %"), (5, "ADX")):
+        fig.update_yaxes(title_text=t_, row=r_, col=1, title_font=dict(size=9))
+    fig.update_layout(template="plotly_dark", height=640, margin=dict(l=2, r=2, t=6, b=2), dragmode=False,
+                      paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="#0b111d", showlegend=False,
+                      xaxis_rangeslider_visible=False, font=dict(size=10))
+    fig.update_xaxes(gridcolor="#18243e")
+    fig.update_yaxes(gridcolor="#18243e")
+    return fig
+
+
+def render_chart(R: dict, minutes: int, tz: Any) -> None:
+    import streamlit as st
+    X = R.get("X", {})
+    if not X.get("ok"):
+        return _unavailable("Gráfico de Bitcoin", X)
+    st.caption("BTC-USD 1 min (velas cerradas) · EMA 9 azul, 21 ámbar, 50 violeta · RSI · MACD · momentum · ADX")
+    st.plotly_chart(make_chart(X, R.get("forming"), R.get("ctr"), minutes, tz), config={"displayModeBar": False})
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# AUTO-PRUEBAS (SINTÉTICAS)
+# ──────────────────────────────────────────────────────────────────────────────
+def _synth(kind: str, n: int = 220, seed: int = 3, end: Optional[datetime] = None) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    end = end or datetime(2026, 10, 23, 12, 7, 0, tzinfo=timezone.utc)      # inicio de la última vela cerrada
+    if kind == "up":
+        rets = rng.normal(0.00018, 0.00040, n)
+    elif kind == "down":
+        rets = rng.normal(-0.00018, 0.00040, n)
+    elif kind == "reversal":
+        rets = np.concatenate([rng.normal(0.00018, 0.00040, n - 14), rng.normal(-0.0013, 0.00040, 14)])
+    else:  # sideways: ruido alrededor de una media
+        rets = None
+    if rets is not None:
+        closes = 100_000 * np.exp(np.cumsum(rets))
+    else:
+        base = 100_000 + 14 * np.sin(np.arange(n) / 2.2) + rng.normal(0, 18, n)
+        closes = base
+    opens = np.concatenate([[closes[0]], closes[:-1]])
+    hi = np.maximum(opens, closes) * (1 + np.abs(rng.normal(0, 0.00012, n)))
+    lo = np.minimum(opens, closes) * (1 - np.abs(rng.normal(0, 0.00012, n)))
+    times = [pd.Timestamp(end - timedelta(minutes=(n - 1 - i))) for i in range(n)]
+    return pd.DataFrame({"time": times, "open": opens, "high": hi, "low": lo, "close": closes,
+                         "volume": rng.uniform(1, 5, n)})
+
+
+def _fake_R(closed: pd.DataFrame, side: str = "UP", ask: float = 0.60, yes_if_above: bool = True,
+            windows_candles: int = 6, tau: float = 8.0, z: float = 1.2, signal: Optional[str] = None) -> dict:
+    last = closed["time"].iloc[-1]
+    ws = (last + pd.Timedelta(minutes=1) - pd.Timedelta(minutes=windows_candles)).to_pydatetime()
+    ctr = types.SimpleNamespace(ticker="KXBTC15M-T", yes_if_above=yes_if_above, window_start=ws,
+                                close_time=ws + timedelta(minutes=15), reference=float(closed["close"].iloc[-1]))
+    sides = {"UP": {"ask": ask if side == "UP" else 1 - ask + 0.02, "bid": 0.58, "p": 0.75, "edge": 0.06},
+             "DOWN": {"ask": ask if side == "DOWN" else 1 - ask + 0.02, "bid": 0.38, "p": 0.25, "edge": -0.1}}
+    sig = signal or f"BUY {side}"
+    dec = {"signal": sig, "side": side if sig.startswith("BUY") else None, "best": side, "sides": sides,
+           "req_edge": 0.04, "reasons": ["edge ok"], "filters": []}
+    return {"closed": closed, "ctr": ctr, "dec": dec, "filters": [], "lean": None, "p_final": 0.75 if side == "UP" else 0.25,
+            "mp": {"z": z}, "tau_min": tau, "signal": sig, "blockers": [], "q": {"yes_bid": 0.58, "no_bid": 0.38},
+            "mk": {"last_price": 0.6, "liquidity": 120.0, "yes_ask_size": 50, "yes_bid_size": 60, "volume": 100,
+                   "open_interest": 40}, "implied": 0.6}
+
+
+def selftest() -> List[Tuple[str, bool, str]]:
+    T: List[Tuple[str, bool, str]] = []
+
+    def chk(name: str, cond: bool, detail: str = "") -> None:
+        T.append((name, bool(cond), detail))
+
+    x = XCfg()
+    lean_fn = lambda p, dec: None
+
+    up, side, down, rev = _synth("up"), _synth("sideways"), _synth("down", seed=5), _synth("reversal")
+    du, ds, dd = add_indicators(up), add_indicators(side), add_indicators(down)
+
+    # Causalidad: añadir velas futuras no cambia el pasado
+    full = add_indicators(_synth("up", n=260, seed=3))
+    cut = add_indicators(_synth("up", n=260, seed=3).iloc[:200])
+    cols = ["ema9", "ema21", "ema50", "rsi", "macd", "macd_hist", "atr", "adx", "plus_di", "roc5", "v_trend", "n_pos"]
+    chk("indicadores causales (sin mirar el futuro)", all(np.allclose(full[c].iloc[199], cut[c].iloc[199], equal_nan=True) for c in cols))
+    chk("lecturas por vela causales", np.array_equal(reading_series(full, 0)[:200], reading_series(cut, 0)))
+    chk("RSI en [0,100] y ATR > 0", bool(du["rsi"].dropna().between(0, 100).all()) and bool((du["atr"] > 0).all()))
+    chk("ADX mayor en tendencia fuerte que en lateral",
+        add_indicators(_synth("reversal"))["adx"].iloc[-1] > ds["adx"].iloc[-1], f"{add_indicators(_synth('reversal'))['adx'].iloc[-1]:.1f} vs {ds['adx'].iloc[-1]:.1f}")
+
+    # Chart analysis
+    chk("tendencia: serie alcista → BULLISH o NEUTRAL (nunca BEARISH)", chart_analysis(du, x)["trend"] in ("BULLISH", "NEUTRAL"),
+        chart_analysis(du, x)["trend"])
+    chk("tendencia: serie bajista → BEARISH o NEUTRAL (nunca BULLISH)", chart_analysis(dd, x)["trend"] in ("BEARISH", "NEUTRAL"))
+    ca_rev = chart_analysis(add_indicators(rev), x)
+    chk("tendencia: tras un desplome fuerte → BEARISH", ca_rev["trend"] == "BEARISH", ca_rev["trend"])
+    chk("explicación de la tendencia no vacía", len(chart_analysis(du, x)["why"]) >= 3)
+    ob = du.copy(); ob.loc[ob.index[-1], "rsi"] = 78.0
+    chk("sobrecompra detectada con RSI ≥ 70", chart_analysis(ob, x)["overbought"])
+
+    # Chop
+    ch_side = chop_analysis(ds, x)
+    chk("CHOP detectado en mercado lateral", ch_side["state"] == "CHOP", f"{ch_side['state']} {ch_side['points']}pts ADX={ch_side['adx']:.1f}")
+    ch_tr = chop_analysis(add_indicators(rev), x)
+    chk("tendencia fuerte NO es CHOP", ch_tr["state"] != "CHOP", f"{ch_tr['state']} {ch_tr['points']}pts")
+
+    # Compuerta: BUY válido pasa; cada regla lo convierte en WAIT
+    ok_idx = None
+    for sd in range(1, 60):          # busca una serie alcista suave que cumpla confirmación para probar el camino feliz
+        cand = _synth("up", seed=sd)
+        R = enhance(_fake_R(cand), x, lean_fn)
+        if R["signal"] == "BUY UP":
+            ok_idx = sd
+            break
+    chk("camino feliz: existe un caso BUY UP que supera toda la compuerta", ok_idx is not None)
+    if ok_idx is not None:
+        base = _synth("up", seed=ok_idx)
+        R = enhance(_fake_R(base, ask=0.90), x, lean_fn)
+        chk("precio de compra 90¢ → WAIT (ESPERAR)", R["signal"] == "ESPERAR" and any(f["id"] == "price90" and f["status"] == "fail" for f in R["filters"]))
+        R = enhance(_fake_R(base, ask=0.89), x, lean_fn)
+        chk("precio de compra 89¢ no se bloquea por precio", all(f["status"] != "fail" for f in R["filters"] if f["id"] == "price90"))
+        R = enhance(_fake_R(base, windows_candles=1), x, lean_fn)
+        chk("contrato recién iniciado (1 vela dentro) → WAIT", R["signal"] == "ESPERAR" and any(f["id"] == "window" and f["status"] == "fail" for f in R["filters"]))
+        R = enhance(_fake_R(base, side="DOWN", ask=0.60), x, lean_fn)
+        chk("BUY DOWN contra una tendencia alcista → WAIT", R["signal"] == "ESPERAR")
+        R = enhance(_fake_R(base, signal="ESPERAR"), x, lean_fn)
+        chk("ESPERAR de la app nunca se convierte en BUY", R["signal"] == "ESPERAR")
+        n2 = len([f for f in enhance(_fake_R(base), XCfg(confirm_n=2), lean_fn)["filters"] if f["status"] == "fail"])
+        n4 = len([f for f in enhance(_fake_R(base), XCfg(confirm_n=4), lean_fn)["filters"] if f["status"] == "fail"])
+        chk("exigir más confirmaciones nunca reduce los bloqueos (n=4 ≥ n=2)", n4 >= n2, f"{n4} vs {n2}")
+        # una sola confirmación: forzar la última lectura neutral sobre una copia
+        c2 = base.copy()
+        c2.loc[c2.index[-1], "close"] = c2["close"].iloc[-2] * 0.9975      # última vela cerrada cae fuerte
+        c2.loc[c2.index[-1], "low"] = min(c2["low"].iloc[-1], c2["close"].iloc[-1])
+        R = enhance(_fake_R(c2), x, lean_fn)
+        chk("una vela contraria rompe la confirmación → WAIT", R["signal"] == "ESPERAR")
+        Rm = enhance(_fake_R(base), x, lean_fn)
+        chk("enhance añade X con todos los módulos", all(k in Rm["X"] for k in ("chart", "chop", "flip", "exit", "contract", "gate")))
+    R = enhance(_fake_R(side), x, lean_fn)
+    chk("mercado lateral: BUY → WAIT por CHOP", R["signal"] == "ESPERAR" and any(f["id"] == "chop" and f["status"] == "fail" for f in R["filters"]))
+    R = enhance(_fake_R(side), XCfg(block_chop=False), lean_fn)
+    chk("block_chop=False: CHOP solo avisa (no bloquea por sí solo)", all(not (f["id"] == "chop" and f["blocking"] and f["status"] == "fail") for f in R["filters"]))
+    R = enhance({"closed": side.iloc[:30], "dec": {"signal": "ESPERAR", "filters": []}, "ctr": None, "filters": []}, x, lean_fn)
+    chk("pocas velas → análisis no disponible (sin inventar)", R["X"]["ok"] is False)
+
+    # Flip risk
+    fr_tr = flip_risk(du, x, 1, chop_analysis(du, x), 2.0, 4.0)
+    fr_chop = flip_risk(ds, x, 1, ch_side, 0.2, 12.0)
+    chk("Flip Risk: lateral y cerca del umbral > tendencia con colchón", fr_chop["risk"] > fr_tr["risk"], f"{fr_chop['risk']:.0f} vs {fr_tr['risk']:.0f}")
+    chk("Flip Risk: niveles coherentes con el porcentaje",
+        all(f["level"] == ("HIGH" if f["risk"] > x.flip_high else "MEDIUM" if f["risk"] >= x.flip_med else "LOW") for f in (fr_tr, fr_chop)))
+    chk("Flip Risk sin dirección → no disponible", flip_risk(du, x, 0, ch_side, None, None)["available"] is False)
+    chk("Flip Risk ∈ [0,100]", 0 <= fr_chop["risk"] <= 100)
+
+    # Smart Exit
+    ctr = types.SimpleNamespace(yes_if_above=True)
+    dr_ = add_indicators(rev)
+    ex_bad = exit_watch(dr_, x, "UP", ctr, {"yes_bid": 0.30}, chart_analysis(dr_, x), -1, 0.60)
+    chk("Smart Exit: posición UP tras un desplome → STRONG EXIT WARNING", ex_bad["state"] == "STRONG EXIT WARNING", f"{ex_bad['state']} {ex_bad['points']}pts")
+    ex_ok = exit_watch(du, x, "UP", ctr, {"yes_bid": 0.62}, chart_analysis(du, x), 1, 0.60)
+    chk("Smart Exit: posición UP con tendencia alcista sana no es STRONG", ex_ok["state"] != "STRONG EXIT WARNING", ex_ok["state"])
+    ex_dn = exit_watch(dr_, x, "DOWN", ctr, {"no_bid": 0.70}, chart_analysis(dr_, x), -1, 0.60)
+    chk("Smart Exit: posición DOWN que va a favor tras el desplome no es STRONG", ex_dn["state"] != "STRONG EXIT WARNING", ex_dn["state"])
+    chk("Smart Exit: sin posición → NONE", exit_watch(du, x, None, ctr, {}, chart_analysis(du, x), 0, None)["state"] == "NONE")
+    ctr_inv = types.SimpleNamespace(yes_if_above=False)
+    chk("mapeo YES/NO ↔ dirección de BTC respeta contratos invertidos", btc_dir("UP", ctr_inv) == -1 and btc_dir("DOWN", ctr_inv) == 1 and btc_dir("UP", ctr) == 1)
+
+    # Contrato
+    Rk = _fake_R(up)
+    Rk["q"].update({"yes_ask": 0.6, "yes_bid": 0.58, "no_ask": 0.42, "no_bid": 0.4})
+    ck = contract_analysis(Rk, chart_analysis(du, x))
+    chk("contrato: spread = ask − bid", abs(ck["sp_yes"] - 0.02) < 1e-9)
+    Rk2 = _fake_R(up); Rk2["mk"]["liquidity"] = None; Rk2["q"].update({"yes_ask": None, "yes_bid": None, "no_ask": None, "no_bid": None}); Rk2["implied"] = None
+    ck2 = contract_analysis(Rk2, chart_analysis(du, x))
+    chk("contrato: sin datos → None / DATA UNAVAILABLE (no se inventa)", ck2["sp_yes"] is None and ck2["liquidity"] is None
+        and ck2["align"] == "DATA UNAVAILABLE" and _c(ck2["yes_ask"]) == UNAVAILABLE and _f(None) == UNAVAILABLE)
+    chk("contract_analysis sin mercado → no disponible", contract_analysis({"mk": None}, None)["available"] is False)
+    chk("esc() neutraliza $ y HTML", esc("<b>$5</b>") == "&lt;b&gt;&#36;5&lt;/b&gt;")
+    return T
+
+
+if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        res = selftest()
+        for n_, c_, d_ in res:
+            print(("PASS " if c_ else "FAIL ") + n_ + (f"   [{d_}]" if d_ else ""))
+        print(f"\n{sum(1 for _, c_, _ in res if c_)}/{len(res)} pruebas superadas (datos sintéticos)")
+        sys.exit(0 if all(c_ for _, c_, _ in res) else 1)
+    print("Este módulo se importa desde app.py. Pruebas: python edge_suite.py --selftest")
