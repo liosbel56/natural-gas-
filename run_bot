@@ -1,0 +1,38 @@
+"""Ejecuta el motor sin dashboard (consola). Solo señales + shadow/paper trading.
+
+Uso:  python run_bot.py
+"""
+from __future__ import annotations
+
+import time
+
+from btcbot.bootstrap import build_engine
+
+
+def main() -> int:
+    engine = build_engine("config.toml")
+    print("Motor iniciado en modo PAPER. Ctrl+C para detener.")
+    try:
+        while True:
+            t0 = time.time()
+            try:
+                s = engine.step()
+            except Exception as exc:  # noqa: BLE001
+                print(f"Error: {exc!r}")
+                time.sleep(5)
+                continue
+            if s.signal:
+                k = s.kalshi
+                print(f"{time.strftime('%H:%M:%S')} [{s.signal.signal:<16}] BTC={s.reference_price:,.0f} "
+                      f"p_up={s.signal.p_up:.2f} edge={s.signal.edge_net if s.signal.edge_net is not None else float('nan'):+.3f} "
+                      f"conf={s.signal.confidence:.0f} restan={k.seconds_left(s.ts):.0f}s src={s.p_source}")
+            else:
+                print(f"{time.strftime('%H:%M:%S')} {s.status_note or 'DATA UNAVAILABLE'}")
+            time.sleep(max(0.0, engine.collector.cfg.polling.interval_seconds - (time.time() - t0)))
+    except KeyboardInterrupt:
+        engine.stop()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
