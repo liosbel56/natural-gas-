@@ -1,108 +1,13 @@
-""Entrena modelos, valida con walk-forward (purga + embargo), hace backtest y guarda el mejor modelo si
-supera a la base gaussiana FUERA DE MUESTRA.
-
-Uso:  python train_and_backtest.py --train-min 1500 --test-size 500
-Salida: reports/report.md, reports/*.csv y models/ml.pkl (solo si el ML supera a la base).
-"""
-from __future__ import annotations
-
-import argparse
-from pathlib import Path
-
-import numpy as np
+"""Baseline evaluation only; not a profitability claim."""
 import pandas as pd
-
-from btcbot.backtest import frequency_precision_curve, select_and_holdout
-from btcbot.config import load_config
-from btcbot.db import Database
-from btcbot.features import build_dataset, candles_to_df
-from btcbot.metrics import breakdown
-from btcbot.ml import calibration_table, model_zoo, oos_predictions, score, train_final
-from btcbot.signal_engine import SignalConfig
-
-
-def fmt(s: dict | None) -> str:
-    if not s:
-        return "sin operaciones"
-    return (f"n={s['n']}, win rate={s['win_rate']:.1%} (IC95% {s['ci_low']:.1%}–{s['ci_high']:.1%}), "
-            f"PnL neto={s['net_pnl']:+.2f} por contrato-op., ROI={s['roi']:+.1%}, EV/op={s['ev_per_trade']:+.4f}, "
-            f"PF={s['profit_factor']:.2f}, MDD={s['max_drawdown']:.2f}")
-
-
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--config", default="config.toml")
-    ap.add_argument("--train-min", type=int, default=1500, help="ventanas de 15 min mínimas para el 1er entrenamiento")
-    ap.add_argument("--test-size", type=int, default=500)
-    ap.add_argument("--embargo", type=int, default=4)
-    ap.add_argument("--out", default="reports")
-    a = ap.parse_args()
-    cfg = load_config(a.config)
-    db = Database(cfg.general.db_path)
-    out = Path(a.out)
-    out.mkdir(exist_ok=True)
-
-    df = candles_to_df(db.candles("coinbase", 60, limit=10_000_000))
-    if len(df) < 5000:
-        print(f"Solo hay {len(df)} velas. Ejecuta primero: python download_history.py --days 60")
-        return 1
-    data = build_dataset(df)
-    n_w = data["window_ts"].nunique()
-    print(f"Dataset: {len(data)} muestras de {n_w} ventanas ({n_w / 96:.1f} días)")
-
-    zoo = list(model_zoo())
-    oos = oos_predictions(data, zoo, a.train_min, a.test_size, a.embargo, verbose=True)
-    p_cols = ["p_base"] + [f"p_{n}" for n in zoo]
-    sc = score(oos, p_cols)
-    print("\nPrecisión fuera de muestra (menor log_loss = mejor):\n", sc.to_string(index=False))
-    sc.to_csv(out / "model_scores.csv", index=False)
-
-    best = sc.iloc[0]["model"]
-    base_ll = float(sc[sc.model == "base"]["log_loss"].iloc[0])
-    lines = ["# Informe de validación (walk-forward fuera de muestra)", "",
-             "> **Aviso**: el backtest usa un PRECIO DE MERCADO PROXY (Φ(z) ± spread) y un strike proxy (apertura de la "
-             "vela). No demuestra rentabilidad real en Kalshi; solo mide si el modelo mejora a una fórmula ingenua.", "",
-             f"- Ventanas: {n_w} ({n_w/96:.1f} días); muestras OOS: {len(oos)}",
-             f"- Entrenamiento mínimo {a.train_min} ventanas, test {a.test_size}, embargo {a.embargo}", "",
-             "## Puntuación de modelos (OOS)", "", sc.to_string(index=False), ""]
-
-    # Calibración y backtest de la línea base y del mejor modelo
-    for name in dict.fromkeys(["base", best]):
-        col = f"p_{name}"
-        lines += [f"## Modelo `{name}`", "", "### Calibración", "",
-                  calibration_table(oos["y"].to_numpy(), oos[col].to_numpy()).to_string(index=False), ""]
-        curve = frequency_precision_curve(oos, col)
-        curve.to_csv(out / f"freq_precision_{name}.csv", index=False)
-        lines += ["### Curva frecuencia vs precisión (por contrato, tras comisión y slippage)", "", curve.round(4).to_string(index=False), ""]
-        res = select_and_holdout(oos, col)
-        lines += ["### Selección en 1ª mitad → evaluación ciega en 2ª mitad", ""]
-        if res["chosen_min_edge"] is None:
-            lines += [res["note"], ""]
-        else:
-            lines += [f"- min_edge elegido: {res['chosen_min_edge']}", f"- Selección: {fmt(res['selection'])}",
-                      f"- **Holdout**: {fmt(res['holdout'])}", ""]
-            ht = res["holdout_trades"]
-            if len(ht):
-                for by in ("hour_utc", "side"):
-                    lines += [f"Por {by}:", breakdown(ht, by).round(3).to_string(index=False), ""]
-
-    # Guardar el modelo solo si mejora a la base de forma material
-    improves = best != "base" and (base_ll - float(sc.iloc[0]["log_loss"])) > 0.001
-    lines += ["## Decisión", ""]
-    if improves:
-        pred = train_final(data, best)
-        Path("models").mkdir(exist_ok=True)
-        pred.save("models/ml.pkl")
-        lines.append(f"`{best}` mejora a la base gaussiana en log-loss OOS ({base_ll:.4f} → {sc.iloc[0]['log_loss']:.4f}). "
-                     "Guardado en models/ml.pkl.")
-    else:
-        lines.append("Ningún modelo mejora de forma material a la base gaussiana fuera de muestra: NO se guarda modelo "
-                     "ML y el sistema en vivo usará Φ(z).")
-    (out / "report.md").write_text("\n".join(lines), encoding="utf-8")
-    print("\n" + "\n".join(lines[-3:]))
-    print(f"\nInforme completo: {out / 'report.md'}")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+from btcbot.market_data import get_coinbase_candles
+from btcbot.features import add_features
+if __name__=="__main__":
+    df=add_features(get_coinbase_candles(limit=300))
+    if df.empty: raise SystemExit("No candle data.")
+    df["future_return_5m"]=df.close.shift(-5)/df.close-1
+    df["ema_up"]=df.ema9>df.ema21
+    valid=df.dropna(subset=["future_return_5m"])
+    hit=((valid.ema_up & (valid.future_return_5m>0)) | (~valid.ema_up & (valid.future_return_5m<0))).mean()
+    print(f"Naive EMA direction hit-rate (exploratory, not walk-forward): {hit:.1%}")
+    print("This is not a Kalshi backtest and does not include contract fills or fees.")
