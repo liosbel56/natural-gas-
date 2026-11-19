@@ -1,50 +1,8 @@
-"""Descarga velas de 1 minuto de Coinbase (BTC-USD) a la base de datos, en bloques de 300.
-
-Uso:  python download_history.py --days 60
-Es reanudable: puedes volver a ejecutarlo y solo reemplaza velas ya guardadas con los mismos valores.
-"""
-from __future__ import annotations
-
 import argparse
-import time
-from datetime import datetime, timezone
-
-from btcbot.config import load_config
-from btcbot.db import Database
-from btcbot.http import JsonClient
-from btcbot.models import Candle
-
-
-def iso(ts: float) -> str:
-    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--days", type=float, default=60)
-    ap.add_argument("--config", default="config.toml")
-    a = ap.parse_args()
-    cfg = load_config(a.config)
-    db = Database(cfg.general.db_path)
-    http = JsonClient(cfg.polling.http_timeout_seconds, max_retries=4, backoff_base=1.0)
-    end = int(time.time() // 60) * 60  # velas anteriores al minuto actual => todas cerradas
-    start = end - int(a.days * 86400)
-    cur, total = start, 0
-    while cur < end:
-        chunk_end = min(cur + 300 * 60, end)
-        rows = http.get(cfg.coinbase.base_url, f"/products/{cfg.coinbase.product}/candles",
-                        {"granularity": 60, "start": iso(cur), "end": iso(chunk_end)})
-        for r in rows:  # [time, low, high, open, close, volume]
-            t = int(r[0])
-            if cur <= t < chunk_end:
-                db.upsert_candle(Candle("coinbase", 60, t, float(r[3]), float(r[2]), float(r[1]), float(r[4]), float(r[5])))
-                total += 1
-        cur = chunk_end
-        print(f"\r{(cur - start) / (end - start):6.1%}  velas guardadas: {total}", end="", flush=True)
-        time.sleep(0.15)  # respeta el lÃ­mite de peticiones pÃºblicas
-    print(f"\nListo: {db.count('candles')} velas en la base de datos.")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+from btcbot.market_data import get_coinbase_candles
+if __name__=="__main__":
+    p=argparse.ArgumentParser(); p.add_argument("--days",type=int,default=30); args=p.parse_args()
+    # Coinbase public endpoint returns a bounded recent window; repeated pagination is not implemented here.
+    df=get_coinbase_candles(limit=min(300,args.days*1440))
+    df.to_csv("reports/coinbase_recent_1m.csv",index=False)
+    print(f"Saved {len(df)} recent closed candles. Coinbase endpoint limit applies.")
