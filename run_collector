@@ -1,60 +1,10 @@
-"""Punto de entrada de la entrega 1: recolecta datos reales, los valida y los guarda en SQLite.
-
-Uso:
-    python run_collector.py                 # bucle continuo (Ctrl+C para parar)
-    python run_collector.py --cycles 5      # 5 ciclos y sale (prueba rápida de conectividad)
-"""
-from __future__ import annotations
-
-import argparse
-import logging
-import sys
-
-from btcbot.collector import Collector
-from btcbot.config import ConfigError, load_config
-from btcbot.db import Database
-from btcbot.logging_setup import setup_logging
-
-
-def main() -> int:
-    ap = argparse.ArgumentParser(description="Colector de datos BTC / Kalshi (modo paper)")
-    ap.add_argument("--config", default="config.toml")
-    ap.add_argument("--cycles", type=int, default=None, help="número de ciclos (por defecto infinito)")
-    args = ap.parse_args()
-
+from btcbot.market_data import get_coinbase_candles,get_kalshi_market
+if __name__=="__main__":
     try:
-        cfg = load_config(args.config)
-    except ConfigError as exc:
-        print(f"Error de configuración: {exc}", file=sys.stderr)
-        return 2
-
-    setup_logging(cfg.general.log_dir, cfg.general.log_level)
-    log = logging.getLogger("btcbot")
-    db = Database(cfg.general.db_path)
-    collector = Collector(cfg, db)
-    log.info("Colector iniciado (modo %s). Ctrl+C para detener.", cfg.general.mode)
-
-    if args.cycles:  # modo prueba: imprime un resumen por ciclo
-        import time
-        for _ in range(args.cycles):
-            snap, rep = collector.poll_once()
-            px = ", ".join(f"{s}={q.price:,.2f}" for s, q in snap.quotes.items()) or "sin precios"
-            k = snap.kalshi
-            kal = (f"{k.ticker} yes_ask={k.yes_ask} close_in={k.seconds_left(snap.ts):.0f}s" if k else "sin Kalshi")
-            print(f"[{rep.status}] {px} | {kal}" + (f" | {'; '.join(rep.reasons)}" if rep.reasons else ""))
-            time.sleep(cfg.polling.interval_seconds)
-        collector.shutdown()
-        return 0
-
+        df=get_coinbase_candles()
+        print(f"[OK] Coinbase: {len(df)} velas cerradas")
+    except Exception as e: print("[ERROR] Coinbase:",repr(e))
     try:
-        collector.run_forever()
-    except KeyboardInterrupt:
-        log.info("Detenido por el usuario.")
-    finally:
-        collector.shutdown()
-        db.close()
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+        m=get_kalshi_market()
+        print("[OK] Kalshi market:",m.get("ticker") if m else "No hay mercados abiertos")
+    except Exception as e: print("[ERROR] Kalshi:",repr(e))
